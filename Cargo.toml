@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/*",
+  "packages/transformers/js/core"
+]
+
+[profile.canary]
+inherits = "release"
+debug = true
