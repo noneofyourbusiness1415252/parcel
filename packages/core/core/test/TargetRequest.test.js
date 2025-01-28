@@ -4,10 +4,18 @@ import assert from 'assert';
 import path from 'path';
 import tempy from 'tempy';
 import {inputFS as fs} from '@parcel/test-utils';
+import {md} from '@parcel/diagnostic';
+import {normalizeSeparators} from '@parcel/utils';
 import {TargetResolver} from '../src/requests/TargetRequest';
-import {DEFAULT_OPTIONS as _DEFAULT_OPTIONS} from './test-utils';
+import {DEFAULT_OPTIONS as _DEFAULT_OPTIONS, relative} from './test-utils';
 
-const DEFAULT_OPTIONS = {..._DEFAULT_OPTIONS, sourceMaps: true};
+const DEFAULT_OPTIONS = {
+  ..._DEFAULT_OPTIONS,
+  defaultTargetOptions: {
+    ..._DEFAULT_OPTIONS.defaultTargetOptions,
+    sourceMaps: true,
+  },
+};
 
 const COMMON_TARGETS_FIXTURE_PATH = path.join(
   __dirname,
@@ -65,10 +73,12 @@ describe('TargetResolver', () => {
   let api = {
     invalidateOnFileCreate() {},
     invalidateOnFileUpdate() {},
+    invalidateOnConfigKeyChange() {},
     invalidateOnFileDelete() {},
     invalidateOnEnvChange() {},
     invalidateOnOptionChange() {},
     invalidateOnStartup() {},
+    invalidateOnBuild() {},
     getInvalidations() {
       return [];
     },
@@ -78,6 +88,14 @@ describe('TargetResolver', () => {
     storeResult() {},
     canSkipSubrequest() {
       return false;
+    },
+    getPreviousResult() {},
+    getRequestResult() {},
+    getSubRequests() {
+      return [];
+    },
+    getInvalidSubRequests() {
+      return [];
     },
   };
 
@@ -105,9 +123,9 @@ describe('TargetResolver', () => {
         {
           name: 'customA',
           publicUrl: '/',
-          distDir: path.resolve('customA'),
+          distDir: normalizeSeparators(path.resolve('customA')),
           env: {
-            id: '2bbfcf5ea2bb87e160da13caff67db8f',
+            id: '1d40417b63734b32',
             context: 'browser',
             includeNodeModules: true,
             engines: {
@@ -115,18 +133,20 @@ describe('TargetResolver', () => {
             },
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
         },
         {
           name: 'customB',
           publicUrl: '/',
           distEntry: 'b.js',
-          distDir: path.resolve('customB'),
+          distDir: normalizeSeparators(path.resolve('customB')),
           env: {
-            id: '6998383bc9be968857af07758ec34b4f',
+            id: '928f0d1c941b2e57',
             context: 'node',
             includeNodeModules: false,
             engines: {
@@ -134,9 +154,11 @@ describe('TargetResolver', () => {
             },
             outputFormat: 'commonjs',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
         },
       ],
@@ -151,11 +173,11 @@ describe('TargetResolver', () => {
       [
         {
           name: 'main',
-          distDir: path.join(__dirname, 'fixtures/common-targets/dist/main'),
+          distDir: 'fixtures/common-targets/dist/main',
           distEntry: 'index.js',
           publicUrl: '/',
           env: {
-            id: 'f4baf35b3b94e63f7c6307153fce8f3e',
+            id: 'b552bd32da37fa8b',
             context: 'node',
             engines: {
               node: '>= 8.0.0',
@@ -163,29 +185,33 @@ describe('TargetResolver', () => {
             includeNodeModules: false,
             outputFormat: 'commonjs',
             isLibrary: true,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: true,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 11,
               line: 2,
             },
             end: {
-              column: 30,
+              column: 31,
               line: 2,
             },
           },
         },
         {
           name: 'module',
-          distDir: path.join(__dirname, 'fixtures/common-targets/dist/module'),
+          distDir: 'fixtures/common-targets/dist/module',
           distEntry: 'index.js',
           publicUrl: '/',
           env: {
-            id: '5a263676bee4cf8248c32f0b48b22902',
+            id: '8804e4eb97e2703e',
             context: 'browser',
             engines: {
               browsers: ['last 1 version'],
@@ -193,31 +219,35 @@ describe('TargetResolver', () => {
             includeNodeModules: false,
             outputFormat: 'esmodule',
             isLibrary: true,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: true,
             sourceMap: {
               inlineSources: true,
             },
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 13,
               line: 3,
             },
             end: {
-              column: 34,
+              column: 35,
               line: 3,
             },
           },
         },
         {
           name: 'browser',
-          distDir: path.join(__dirname, 'fixtures/common-targets/dist/browser'),
+          distDir: 'fixtures/common-targets/dist/browser',
           distEntry: 'index.js',
           publicUrl: '/assets',
           env: {
-            id: 'ee3d4744fab93996af88b671fb4a0029',
+            id: 'a7ed3e73c53f1923',
             context: 'browser',
             engines: {
               browsers: ['last 1 version'],
@@ -225,18 +255,22 @@ describe('TargetResolver', () => {
             includeNodeModules: false,
             outputFormat: 'commonjs',
             isLibrary: true,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: true,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 14,
               line: 4,
             },
             end: {
-              column: 36,
+              column: 37,
               line: 4,
             },
           },
@@ -253,11 +287,13 @@ describe('TargetResolver', () => {
       [
         {
           name: 'app',
-          distDir: path.join(COMMON_TARGETS_IGNORE_FIXTURE_PATH, 'dist'),
+          distDir: relative(
+            path.join(COMMON_TARGETS_IGNORE_FIXTURE_PATH, 'dist'),
+          ),
           distEntry: 'index.js',
           publicUrl: '/',
           env: {
-            id: 'cebf5179f904ad2c9432ca3dd6222bfe',
+            id: 'f7c9644283a8698f',
             context: 'node',
             engines: {
               node: '>= 8.0.0',
@@ -265,21 +301,22 @@ describe('TargetResolver', () => {
             includeNodeModules: false,
             outputFormat: 'commonjs',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: undefined,
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(
-              COMMON_TARGETS_IGNORE_FIXTURE_PATH,
-              'package.json',
+            filePath: relative(
+              path.join(COMMON_TARGETS_IGNORE_FIXTURE_PATH, 'package.json'),
             ),
             start: {
               column: 10,
               line: 3,
             },
             end: {
-              column: 24,
+              column: 25,
               line: 3,
             },
           },
@@ -295,11 +332,11 @@ describe('TargetResolver', () => {
       [
         {
           name: 'main',
-          distDir: path.join(__dirname, 'fixtures/custom-targets/dist/main'),
+          distDir: 'fixtures/custom-targets/dist/main',
           distEntry: 'index.js',
           publicUrl: '/',
           env: {
-            id: 'f4baf35b3b94e63f7c6307153fce8f3e',
+            id: 'b552bd32da37fa8b',
             context: 'node',
             engines: {
               node: '>= 8.0.0',
@@ -307,32 +344,33 @@ describe('TargetResolver', () => {
             includeNodeModules: false,
             outputFormat: 'commonjs',
             isLibrary: true,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: true,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 11,
               line: 2,
             },
             end: {
-              column: 30,
+              column: 31,
               line: 2,
             },
           },
         },
         {
           name: 'browserModern',
-          distDir: path.join(
-            __dirname,
-            'fixtures/custom-targets/dist/browserModern',
-          ),
+          distDir: 'fixtures/custom-targets/dist/browserModern',
           distEntry: 'index.js',
           publicUrl: '/',
           env: {
-            id: 'f6f700fe6b930b17f56439448c57e060',
+            id: '1f28e9ceaf633d83',
             context: 'browser',
             engines: {
               browsers: ['last 1 version'],
@@ -340,32 +378,33 @@ describe('TargetResolver', () => {
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 20,
               line: 3,
             },
             end: {
-              column: 48,
+              column: 49,
               line: 3,
             },
           },
         },
         {
           name: 'browserLegacy',
-          distDir: path.join(
-            __dirname,
-            'fixtures/custom-targets/dist/browserLegacy',
-          ),
+          distDir: 'fixtures/custom-targets/dist/browserLegacy',
           distEntry: 'index.js',
           publicUrl: '/',
           env: {
-            id: '61e2044abf03e54962ab861fc0c8e3a8',
+            id: '767bf6e6b675c4f3',
             context: 'browser',
             engines: {
               browsers: ['ie11'],
@@ -373,18 +412,141 @@ describe('TargetResolver', () => {
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 20,
               line: 4,
             },
             end: {
-              column: 48,
+              column: 49,
+              line: 4,
+            },
+          },
+        },
+      ],
+    );
+  });
+
+  it('should not optimize libraries by default', async () => {
+    let targetResolver = new TargetResolver(api, {
+      ...DEFAULT_OPTIONS,
+      mode: 'production',
+      defaultTargetOptions: {
+        ...DEFAULT_OPTIONS.defaultTargetOptions,
+        shouldOptimize: true,
+      },
+    });
+
+    assert.deepEqual(
+      await targetResolver.resolve(CUSTOM_TARGETS_FIXTURE_PATH),
+      [
+        {
+          name: 'main',
+          distDir: 'fixtures/custom-targets/dist/main',
+          distEntry: 'index.js',
+          publicUrl: '/',
+          env: {
+            id: 'b552bd32da37fa8b',
+            context: 'node',
+            engines: {
+              node: '>= 8.0.0',
+            },
+            includeNodeModules: false,
+            outputFormat: 'commonjs',
+            isLibrary: true,
+            shouldOptimize: false,
+            shouldScopeHoist: true,
+            sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
+          },
+          loc: {
+            filePath: relative(
+              path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
+            start: {
+              column: 11,
+              line: 2,
+            },
+            end: {
+              column: 31,
+              line: 2,
+            },
+          },
+        },
+        {
+          name: 'browserModern',
+          distDir: 'fixtures/custom-targets/dist/browserModern',
+          distEntry: 'index.js',
+          publicUrl: '/',
+          env: {
+            id: 'ed7c0e65adee71c9',
+            context: 'browser',
+            engines: {
+              browsers: ['last 1 version'],
+            },
+            includeNodeModules: true,
+            outputFormat: 'global',
+            isLibrary: false,
+            shouldOptimize: true,
+            shouldScopeHoist: false,
+            sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
+          },
+          loc: {
+            filePath: relative(
+              path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
+            start: {
+              column: 20,
+              line: 3,
+            },
+            end: {
+              column: 49,
+              line: 3,
+            },
+          },
+        },
+        {
+          name: 'browserLegacy',
+          distDir: 'fixtures/custom-targets/dist/browserLegacy',
+          distEntry: 'index.js',
+          publicUrl: '/',
+          env: {
+            id: 'f7692543e59e4c0a',
+            context: 'browser',
+            engines: {
+              browsers: ['ie11'],
+            },
+            includeNodeModules: true,
+            outputFormat: 'global',
+            isLibrary: false,
+            shouldOptimize: true,
+            shouldScopeHoist: false,
+            sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
+          },
+          loc: {
+            filePath: relative(
+              path.join(CUSTOM_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
+            start: {
+              column: 20,
+              line: 4,
+            },
+            end: {
+              column: 49,
               line: 4,
             },
           },
@@ -400,11 +562,11 @@ describe('TargetResolver', () => {
       [
         {
           name: 'app',
-          distDir: path.join(__dirname, 'fixtures/custom-targets-distdir/www'),
+          distDir: 'fixtures/custom-targets-distdir/www',
           distEntry: undefined,
           publicUrl: 'www',
           env: {
-            id: 'fbd1c2018703515f23707d6fb810642e',
+            id: 'ddb6ac7c9a3a9178',
             context: 'browser',
             engines: {
               browsers: '> 0.25%',
@@ -412,11 +574,110 @@ describe('TargetResolver', () => {
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
-          loc: undefined,
+          loc: {
+            filePath: relative(
+              path.join(CUSTOM_TARGETS_DISTDIR_FIXTURE_PATH, 'package.json'),
+            ),
+            start: {
+              line: 3,
+              column: 5,
+            },
+            end: {
+              line: 3,
+              column: 10,
+            },
+          },
+        },
+      ],
+    );
+  });
+
+  it('skips targets with custom entry source for default entry', async () => {
+    let targetResolver = new TargetResolver(api, {
+      ...DEFAULT_OPTIONS,
+      targets: {
+        customA: {
+          context: 'browser',
+          distDir: 'customA',
+          source: 'customA/index.js',
+        },
+        customB: {
+          distDir: 'customB',
+        },
+      },
+    });
+
+    assert.deepEqual(
+      await targetResolver.resolve(COMMON_TARGETS_FIXTURE_PATH),
+      [
+        {
+          name: 'customB',
+          distDir: normalizeSeparators(path.resolve('customB')),
+          publicUrl: '/',
+          env: {
+            id: '1d40417b63734b32',
+            context: 'browser',
+            engines: {
+              browsers: ['> 0.25%'],
+            },
+            includeNodeModules: true,
+            outputFormat: 'global',
+            isLibrary: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
+            sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
+          },
+        },
+      ],
+    );
+  });
+
+  it('skips other targets with custom entry', async () => {
+    let targetResolver = new TargetResolver(api, {
+      ...DEFAULT_OPTIONS,
+      targets: {
+        customA: {
+          context: 'browser',
+          distDir: 'customA',
+          source: 'customA/index.js',
+        },
+        customB: {
+          distDir: 'customB',
+        },
+      },
+    });
+
+    assert.deepEqual(
+      await targetResolver.resolve(COMMON_TARGETS_FIXTURE_PATH, 'customA'),
+      [
+        {
+          name: 'customA',
+          distDir: normalizeSeparators(path.resolve('customA')),
+          publicUrl: '/',
+          env: {
+            id: '1d40417b63734b32',
+            context: 'browser',
+            engines: {
+              browsers: ['> 0.25%'],
+            },
+            includeNodeModules: true,
+            outputFormat: 'global',
+            isLibrary: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
+            sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
+          },
+          source: 'customA/index.js',
         },
       ],
     );
@@ -424,31 +685,42 @@ describe('TargetResolver', () => {
 
   it('resolves main target with context from package.json', async () => {
     let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
-    assert.deepEqual(await targetResolver.resolve(CONTEXT_FIXTURE_PATH), [
+    let res = await targetResolver.resolve(CONTEXT_FIXTURE_PATH);
+    assert.deepEqual(res, [
       {
         name: 'main',
-        distDir: path.join(__dirname, 'fixtures/context/dist/main'),
+        distDir: 'fixtures/context/dist/main',
         distEntry: 'index.js',
         publicUrl: '/',
         env: {
-          id: '60e4160438cbc3393873f192d9d5d162',
+          id: res[0].env.id,
           context: 'node',
-          engines: {},
+          engines: {
+            browsers: [
+              'last 1 Chrome version',
+              'last 1 Safari version',
+              'last 1 Firefox version',
+              'last 1 Edge version',
+            ],
+            node: process.versions.node,
+          },
           includeNodeModules: false,
           isLibrary: true,
           outputFormat: 'commonjs',
-          minify: false,
-          scopeHoist: false,
+          shouldOptimize: false,
+          shouldScopeHoist: true,
           sourceMap: {},
+          loc: undefined,
+          sourceType: 'module',
         },
         loc: {
-          filePath: path.join(CONTEXT_FIXTURE_PATH, 'package.json'),
+          filePath: relative(path.join(CONTEXT_FIXTURE_PATH, 'package.json')),
           start: {
             column: 11,
             line: 2,
           },
           end: {
-            column: 30,
+            column: 31,
             line: 2,
           },
         },
@@ -456,28 +728,371 @@ describe('TargetResolver', () => {
     ]);
   });
 
-  it('resolves main target as an application when non-js file extension is used', async () => {
+  it('errors when the main target contains a non-js extension', async () => {
     let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
     let fixture = path.join(__dirname, 'fixtures/application-targets');
+    let code = await fs.readFile(path.join(fixture, 'package.json'), 'utf8');
+
+    // $FlowFixMe
+    await assert.rejects(() => targetResolver.resolve(fixture), {
+      diagnostics: [
+        {
+          message: 'Unexpected output file type .html in target "main"',
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  end: {
+                    column: 27,
+                    line: 2,
+                  },
+                  message: 'File extension must be .js, .mjs, or .cjs',
+                  start: {
+                    column: 11,
+                    line: 2,
+                  },
+                },
+              ],
+            },
+          ],
+          hints: [
+            'The "main" field is meant for libraries. If you meant to output a .html file, either remove the "main" field or choose a different target name.',
+          ],
+          documentationURL:
+            'https://parceljs.org/features/targets/#library-targets',
+        },
+      ],
+    });
+  });
+
+  it('errors when the main target uses the global output format', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/main-global');
+    let code = await fs.readFile(path.join(fixture, 'package.json'), 'utf8');
+
+    // $FlowFixMe
+    await assert.rejects(() => targetResolver.resolve(fixture), {
+      diagnostics: [
+        {
+          message:
+            'The "global" output format is not supported in the "main" target.',
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  message: undefined,
+                  end: {
+                    column: 30,
+                    line: 5,
+                  },
+                  start: {
+                    column: 23,
+                    line: 5,
+                  },
+                },
+              ],
+            },
+          ],
+          hints: [
+            'The "main" field is meant for libraries. The outputFormat must be either "commonjs" or "esmodule". Either change or remove the declared outputFormat.',
+          ],
+          documentationURL:
+            'https://parceljs.org/features/targets/#library-targets',
+        },
+      ],
+    });
+  });
+
+  it('errors when the main target uses the esmodule output format without a .mjs extension or "type": "module" field', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/main-mjs');
+    let code = await fs.readFile(path.join(fixture, 'package.json'), 'utf8');
+
+    // $FlowFixMe
+    await assert.rejects(() => targetResolver.resolve(fixture), {
+      diagnostics: [
+        {
+          message:
+            'Output format "esmodule" cannot be used in the "main" target without a .mjs extension or "type": "module" field.',
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  message: 'Declared output format defined here',
+                  end: {
+                    column: 32,
+                    line: 5,
+                  },
+                  start: {
+                    column: 23,
+                    line: 5,
+                  },
+                },
+                {
+                  message: 'Inferred output format defined here',
+                  end: {
+                    column: 25,
+                    line: 2,
+                  },
+                  start: {
+                    column: 11,
+                    line: 2,
+                  },
+                },
+              ],
+            },
+          ],
+          hints: [
+            'Either change the output file extension to .mjs, add "type": "module" to package.json, or remove the declared outputFormat.',
+          ],
+          documentationURL:
+            'https://parceljs.org/features/targets/#library-targets',
+        },
+      ],
+    });
+  });
+
+  it('errors when the inferred output format does not match the declared one in common targets', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/main-format-mismatch');
+    let code = await fs.readFile(path.join(fixture, 'package.json'), 'utf8');
+
+    // $FlowFixMe
+    await assert.rejects(() => targetResolver.resolve(fixture), {
+      diagnostics: [
+        {
+          message:
+            'Declared output format "esmodule" does not match expected output format "commonjs".',
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  message: 'Declared output format defined here',
+                  end: {
+                    column: 32,
+                    line: 5,
+                  },
+                  start: {
+                    column: 23,
+                    line: 5,
+                  },
+                },
+                {
+                  message: 'Inferred output format defined here',
+                  end: {
+                    column: 26,
+                    line: 2,
+                  },
+                  start: {
+                    column: 11,
+                    line: 2,
+                  },
+                },
+              ],
+            },
+          ],
+          hints: [
+            'Either remove the target\'s declared "outputFormat" or change the extension to .mjs or .js.',
+          ],
+          documentationURL:
+            'https://parceljs.org/features/targets/#library-targets',
+        },
+      ],
+    });
+  });
+
+  it('errors when the inferred output format does not match the declared one in custom targets', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/custom-format-mismatch');
+    let code = await fs.readFile(path.join(fixture, 'package.json'), 'utf8');
+
+    // $FlowFixMe
+    await assert.rejects(() => targetResolver.resolve(fixture), {
+      diagnostics: [
+        {
+          message:
+            'Declared output format "commonjs" does not match expected output format "esmodule".',
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  message: 'Declared output format defined here',
+                  end: {
+                    column: 32,
+                    line: 5,
+                  },
+                  start: {
+                    column: 23,
+                    line: 5,
+                  },
+                },
+                {
+                  message: 'Inferred output format defined here',
+                  end: {
+                    column: 26,
+                    line: 2,
+                  },
+                  start: {
+                    column: 11,
+                    line: 2,
+                  },
+                },
+              ],
+            },
+          ],
+          hints: [
+            'Either remove the target\'s declared "outputFormat" or change the extension to .cjs or .js.',
+          ],
+          documentationURL:
+            'https://parceljs.org/features/targets/#library-targets',
+        },
+      ],
+    });
+  });
+
+  it('errors when a common library target turns scope hoisting off', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/library-scopehoist');
+    let code = await fs.readFile(path.join(fixture, 'package.json'), 'utf8');
+
+    // $FlowFixMe
+    await assert.rejects(() => targetResolver.resolve(fixture), {
+      diagnostics: [
+        {
+          message: 'Scope hoisting cannot be disabled for library targets.',
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  message: undefined,
+                  end: {
+                    column: 25,
+                    line: 5,
+                  },
+                  start: {
+                    column: 21,
+                    line: 5,
+                  },
+                },
+              ],
+            },
+          ],
+          hints: [
+            'The "main" target is meant for libraries. Either remove the "scopeHoist" option, or use a different target name.',
+          ],
+          documentationURL:
+            'https://parceljs.org/features/targets/#library-targets',
+        },
+      ],
+    });
+  });
+
+  it('errors when a custom library target turns scope hoisting off', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/library-custom-scopehoist');
+    let code = await fs.readFile(path.join(fixture, 'package.json'), 'utf8');
+
+    // $FlowFixMe
+    await assert.rejects(() => targetResolver.resolve(fixture), {
+      diagnostics: [
+        {
+          message: 'Scope hoisting cannot be disabled for library targets.',
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  message: undefined,
+                  end: {
+                    column: 25,
+                    line: 6,
+                  },
+                  start: {
+                    column: 21,
+                    line: 6,
+                  },
+                },
+                {
+                  message: undefined,
+                  end: {
+                    column: 23,
+                    line: 5,
+                  },
+                  start: {
+                    column: 20,
+                    line: 5,
+                  },
+                },
+              ],
+            },
+          ],
+          hints: ['Either remove the "scopeHoist" or "isLibrary" option.'],
+          documentationURL:
+            'https://parceljs.org/features/targets/#library-targets',
+        },
+      ],
+    });
+  });
+
+  it('should infer output format for custom targets by extension', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/custom-format-infer-ext');
+
     assert.deepEqual(await targetResolver.resolve(fixture), [
       {
-        name: 'main',
-        distDir: path.join(fixture, 'dist'),
-        distEntry: 'index.html',
+        name: 'test',
+        distDir: relative(path.join(fixture, 'dist')),
+        distEntry: 'index.mjs',
         publicUrl: '/',
         env: {
-          id: '731766329e2871538bb5cbfdbe551905',
+          id: '439701173a9199ea',
           context: 'browser',
-          engines: {},
+          engines: {
+            browsers: [
+              'last 1 Chrome version',
+              'last 1 Safari version',
+              'last 1 Firefox version',
+              'last 1 Edge version',
+            ],
+          },
           includeNodeModules: true,
+          outputFormat: 'esmodule',
           isLibrary: false,
-          outputFormat: 'global',
-          minify: false,
-          scopeHoist: false,
+          shouldOptimize: false,
+          shouldScopeHoist: false,
           sourceMap: {},
+          loc: undefined,
+          sourceType: 'module',
         },
         loc: {
-          filePath: path.join(fixture, 'package.json'),
+          filePath: relative(path.join(fixture, 'package.json')),
           start: {
             column: 11,
             line: 2,
@@ -485,6 +1100,51 @@ describe('TargetResolver', () => {
           end: {
             column: 27,
             line: 2,
+          },
+        },
+      },
+    ]);
+  });
+
+  it('should infer output format for custom targets by "type": "module" field', async () => {
+    let targetResolver = new TargetResolver(api, DEFAULT_OPTIONS);
+    let fixture = path.join(__dirname, 'fixtures/custom-format-infer-type');
+
+    assert.deepEqual(await targetResolver.resolve(fixture), [
+      {
+        name: 'test',
+        distDir: relative(path.join(fixture, 'dist')),
+        distEntry: 'index.js',
+        publicUrl: '/',
+        env: {
+          id: '439701173a9199ea',
+          context: 'browser',
+          engines: {
+            browsers: [
+              'last 1 Chrome version',
+              'last 1 Safari version',
+              'last 1 Firefox version',
+              'last 1 Edge version',
+            ],
+          },
+          includeNodeModules: true,
+          outputFormat: 'esmodule',
+          isLibrary: false,
+          shouldOptimize: false,
+          shouldScopeHoist: false,
+          sourceMap: {},
+          loc: undefined,
+          sourceType: 'module',
+        },
+        loc: {
+          filePath: relative(path.join(fixture, 'package.json')),
+          start: {
+            column: 11,
+            line: 3,
+          },
+          end: {
+            column: 26,
+            line: 3,
           },
         },
       },
@@ -502,11 +1162,11 @@ describe('TargetResolver', () => {
       [
         {
           name: 'main',
-          distDir: path.join(__dirname, 'fixtures/common-targets/dist/main'),
+          distDir: 'fixtures/common-targets/dist/main',
           distEntry: 'index.js',
           publicUrl: '/',
           env: {
-            id: 'f4baf35b3b94e63f7c6307153fce8f3e',
+            id: 'b552bd32da37fa8b',
             context: 'node',
             engines: {
               node: '>= 8.0.0',
@@ -514,29 +1174,33 @@ describe('TargetResolver', () => {
             includeNodeModules: false,
             outputFormat: 'commonjs',
             isLibrary: true,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: true,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 11,
               line: 2,
             },
             end: {
-              column: 30,
+              column: 31,
               line: 2,
             },
           },
         },
         {
           name: 'browser',
-          distDir: path.join(__dirname, 'fixtures/common-targets/dist/browser'),
+          distDir: 'fixtures/common-targets/dist/browser',
           distEntry: 'index.js',
           publicUrl: '/assets',
           env: {
-            id: 'ee3d4744fab93996af88b671fb4a0029',
+            id: 'a7ed3e73c53f1923',
             context: 'browser',
             engines: {
               browsers: ['last 1 version'],
@@ -544,18 +1208,22 @@ describe('TargetResolver', () => {
             includeNodeModules: false,
             outputFormat: 'commonjs',
             isLibrary: true,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: true,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
           loc: {
-            filePath: path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            filePath: relative(
+              path.join(COMMON_TARGETS_FIXTURE_PATH, 'package.json'),
+            ),
             start: {
               column: 14,
               line: 4,
             },
             end: {
-              column: 36,
+              column: 37,
               line: 4,
             },
           },
@@ -577,18 +1245,27 @@ describe('TargetResolver', () => {
       [
         {
           name: 'default',
-          distDir: serveDistDir,
+          distDir: '.parcel-cache/dist',
           publicUrl: '/',
           env: {
-            id: '731766329e2871538bb5cbfdbe551905',
+            id: 'd6ea1d42532a7575',
             context: 'browser',
-            engines: {},
+            engines: {
+              browsers: [
+                'last 1 Chrome version',
+                'last 1 Safari version',
+                'last 1 Firefox version',
+                'last 1 Edge version',
+              ],
+            },
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
         },
       ],
@@ -603,10 +1280,12 @@ describe('TargetResolver', () => {
       [
         {
           name: 'default',
-          distDir: path.join(DEFAULT_DISTPATH_FIXTURE_PATHS.none, 'dist'),
+          distDir: relative(
+            path.join(DEFAULT_DISTPATH_FIXTURE_PATHS.none, 'dist'),
+          ),
           publicUrl: '/',
           env: {
-            id: 'f30b1b1f9bc625becd70ec6bc8198eb3',
+            id: 'a9c07d094d038c73',
             context: 'browser',
             engines: {
               browsers: ['Chrome 80'],
@@ -614,9 +1293,11 @@ describe('TargetResolver', () => {
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
         },
       ],
@@ -631,11 +1312,13 @@ describe('TargetResolver', () => {
       [
         {
           name: 'browserModern',
-          distDir: path.join(DEFAULT_DISTPATH_FIXTURE_PATHS.one, 'dist'),
+          distDir: relative(
+            path.join(DEFAULT_DISTPATH_FIXTURE_PATHS.one, 'dist'),
+          ),
           distEntry: undefined,
           publicUrl: '/',
           env: {
-            id: 'f30b1b1f9bc625becd70ec6bc8198eb3',
+            id: 'a9c07d094d038c73',
             context: 'browser',
             engines: {
               browsers: ['Chrome 80'],
@@ -643,11 +1326,25 @@ describe('TargetResolver', () => {
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
-          loc: undefined,
+          loc: {
+            filePath: relative(
+              path.join(DEFAULT_DISTPATH_FIXTURE_PATHS.one, 'package.json'),
+            ),
+            start: {
+              line: 3,
+              column: 5,
+            },
+            end: {
+              line: 3,
+              column: 20,
+            },
+          },
         },
       ],
     );
@@ -661,15 +1358,17 @@ describe('TargetResolver', () => {
       [
         {
           name: 'browserModern',
-          distDir: path.join(
-            DEFAULT_DISTPATH_FIXTURE_PATHS.two,
-            'dist',
-            'browserModern',
+          distDir: relative(
+            path.join(
+              DEFAULT_DISTPATH_FIXTURE_PATHS.two,
+              'dist',
+              'browserModern',
+            ),
           ),
           distEntry: undefined,
           publicUrl: '/',
           env: {
-            id: 'f6f700fe6b930b17f56439448c57e060',
+            id: '1f28e9ceaf633d83',
             context: 'browser',
             engines: {
               browsers: ['last 1 version'],
@@ -677,23 +1376,39 @@ describe('TargetResolver', () => {
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
-          loc: undefined,
+          loc: {
+            filePath: relative(
+              path.join(DEFAULT_DISTPATH_FIXTURE_PATHS.two, 'package.json'),
+            ),
+            start: {
+              line: 3,
+              column: 5,
+            },
+            end: {
+              line: 3,
+              column: 20,
+            },
+          },
         },
         {
           name: 'browserLegacy',
-          distDir: path.join(
-            DEFAULT_DISTPATH_FIXTURE_PATHS.two,
-            'dist',
-            'browserLegacy',
+          distDir: relative(
+            path.join(
+              DEFAULT_DISTPATH_FIXTURE_PATHS.two,
+              'dist',
+              'browserLegacy',
+            ),
           ),
           distEntry: undefined,
           publicUrl: '/',
           env: {
-            id: '0036eed1f5d93ad9b6510b2e27210cec',
+            id: '824e113c03cab3c8',
             context: 'browser',
             engines: {
               browsers: ['IE 11'],
@@ -701,11 +1416,25 @@ describe('TargetResolver', () => {
             includeNodeModules: true,
             outputFormat: 'global',
             isLibrary: false,
-            minify: false,
-            scopeHoist: false,
+            shouldOptimize: false,
+            shouldScopeHoist: false,
             sourceMap: {},
+            loc: undefined,
+            sourceType: 'module',
           },
-          loc: undefined,
+          loc: {
+            filePath: relative(
+              path.join(DEFAULT_DISTPATH_FIXTURE_PATHS.two, 'package.json'),
+            ),
+            start: {
+              line: 10,
+              column: 5,
+            },
+            end: {
+              line: 10,
+              column: 20,
+            },
+          },
         },
       ],
     );
@@ -748,43 +1477,45 @@ describe('TargetResolver', () => {
           {
             message: 'Invalid target descriptor for target "main"',
             origin: '@parcel/core',
-            filePath: undefined,
-            language: 'json',
-            codeFrame: {
-              code,
-              codeHighlights: [
-                {
-                  start: {line: 6, column: 5},
-                  end: {line: 6, column: 8},
-                  message: 'Expected a wildcard or filepath',
-                },
-                {
-                  start: {line: 8, column: 15},
-                  end: {line: 8, column: 21},
-                  message: 'Did you mean "node"?',
-                },
-                {
-                  start: {line: 9, column: 20},
-                  end: {line: 9, column: 27},
-                  message: 'Did you mean "esmodule"?',
-                },
-                {
-                  start: {line: 12, column: 15},
-                  end: {line: 12, column: 21},
-                  message: 'Expected type boolean',
-                },
-                {
-                  start: {line: 13, column: 5},
-                  end: {line: 13, column: 13},
-                  message: 'Possible values: "inlineSources"',
-                },
-                {
-                  start: {line: 17, column: 5},
-                  end: {line: 17, column: 13},
-                  message: 'Did you mean "browsers"?',
-                },
-              ],
-            },
+            codeFrames: [
+              {
+                filePath: undefined,
+                language: 'json',
+                code,
+                codeHighlights: [
+                  {
+                    start: {line: 6, column: 5},
+                    end: {line: 6, column: 8},
+                    message: 'Expected a wildcard or filepath',
+                  },
+                  {
+                    start: {line: 8, column: 15},
+                    end: {line: 8, column: 21},
+                    message: 'Did you mean "node"?',
+                  },
+                  {
+                    start: {line: 9, column: 20},
+                    end: {line: 9, column: 27},
+                    message: 'Did you mean "esmodule"?',
+                  },
+                  {
+                    start: {line: 12, column: 15},
+                    end: {line: 12, column: 21},
+                    message: 'Expected type boolean',
+                  },
+                  {
+                    start: {line: 13, column: 5},
+                    end: {line: 13, column: 13},
+                    message: 'Possible values: "inlineSources"',
+                  },
+                  {
+                    start: {line: 17, column: 5},
+                    end: {line: 17, column: 13},
+                    message: 'Did you mean "browsers"?',
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -805,23 +1536,28 @@ describe('TargetResolver', () => {
           {
             message: 'Invalid target descriptor for target "module"',
             origin: '@parcel/core',
-            filePath: path.join(INVALID_TARGETS_FIXTURE_PATH, 'package.json'),
-            language: 'json',
-            codeFrame: {
-              code,
-              codeHighlights: [
-                {
-                  start: {line: 9, column: 29},
-                  end: {line: 9, column: 35},
-                  message: 'Expected type boolean',
-                },
-                {
-                  start: {line: 11, column: 7},
-                  end: {line: 11, column: 17},
-                  message: 'Did you mean "publicUrl"?',
-                },
-              ],
-            },
+            codeFrames: [
+              {
+                filePath: path.join(
+                  INVALID_TARGETS_FIXTURE_PATH,
+                  'package.json',
+                ),
+                language: 'json',
+                code,
+                codeHighlights: [
+                  {
+                    start: {line: 9, column: 29},
+                    end: {line: 9, column: 35},
+                    message: 'Expected type boolean',
+                  },
+                  {
+                    start: {line: 11, column: 7},
+                    end: {line: 11, column: 17},
+                    message: 'Did you mean "publicUrl"?',
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -842,35 +1578,40 @@ describe('TargetResolver', () => {
           {
             message: 'Invalid engines in package.json',
             origin: '@parcel/core',
-            filePath: path.join(INVALID_ENGINES_FIXTURE_PATH, 'package.json'),
-            language: 'json',
-            codeFrame: {
-              code,
-              codeHighlights: [
-                {
-                  end: {
-                    column: 13,
-                    line: 8,
+            codeFrames: [
+              {
+                filePath: path.join(
+                  INVALID_ENGINES_FIXTURE_PATH,
+                  'package.json',
+                ),
+                language: 'json',
+                code,
+                codeHighlights: [
+                  {
+                    end: {
+                      column: 13,
+                      line: 8,
+                    },
+                    message: 'Did you mean "browsers"?',
+                    start: {
+                      column: 5,
+                      line: 8,
+                    },
                   },
-                  message: 'Did you mean "browsers"?',
-                  start: {
-                    column: 5,
-                    line: 8,
+                  {
+                    end: {
+                      column: 5,
+                      line: 7,
+                    },
+                    message: 'Expected type string',
+                    start: {
+                      column: 13,
+                      line: 5,
+                    },
                   },
-                },
-                {
-                  end: {
-                    column: 5,
-                    line: 7,
-                  },
-                  message: 'Expected type string',
-                  start: {
-                    column: 13,
-                    line: 5,
-                  },
-                },
-              ],
-            },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -891,24 +1632,29 @@ describe('TargetResolver', () => {
           {
             message: 'Invalid distPath for target "legacy"',
             origin: '@parcel/core',
-            filePath: path.join(INVALID_DISTPATH_FIXTURE_PATH, 'package.json'),
-            language: 'json',
-            codeFrame: {
-              code,
-              codeHighlights: [
-                {
-                  end: {
-                    column: 13,
-                    line: 2,
+            codeFrames: [
+              {
+                filePath: path.join(
+                  INVALID_DISTPATH_FIXTURE_PATH,
+                  'package.json',
+                ),
+                language: 'json',
+                code,
+                codeHighlights: [
+                  {
+                    end: {
+                      column: 13,
+                      line: 2,
+                    },
+                    message: 'Expected type string',
+                    start: {
+                      column: 13,
+                      line: 2,
+                    },
                   },
-                  message: 'Expected type string',
-                  start: {
-                    column: 13,
-                    line: 2,
-                  },
-                },
-              ],
-            },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -926,39 +1672,41 @@ describe('TargetResolver', () => {
     await assert.rejects(() => targetResolver.resolve(fixture), {
       diagnostics: [
         {
-          message: `Multiple targets have the same destination path "${path.normalize(
+          message: md`Multiple targets have the same destination path "${path.normalize(
             'dist/index.js',
           )}"`,
           origin: '@parcel/core',
-          filePath: path.join(fixture, 'package.json'),
-          language: 'json',
-          codeFrame: {
-            code,
-            codeHighlights: [
-              {
-                end: {
-                  column: 25,
-                  line: 2,
+          codeFrames: [
+            {
+              filePath: path.join(fixture, 'package.json'),
+              language: 'json',
+              code,
+              codeHighlights: [
+                {
+                  end: {
+                    column: 25,
+                    line: 2,
+                  },
+                  message: undefined,
+                  start: {
+                    column: 11,
+                    line: 2,
+                  },
                 },
-                message: undefined,
-                start: {
-                  column: 11,
-                  line: 2,
+                {
+                  end: {
+                    column: 27,
+                    line: 3,
+                  },
+                  message: undefined,
+                  start: {
+                    column: 13,
+                    line: 3,
+                  },
                 },
-              },
-              {
-                end: {
-                  column: 27,
-                  line: 3,
-                },
-                message: undefined,
-                start: {
-                  column: 13,
-                  line: 3,
-                },
-              },
-            ],
-          },
+              ],
+            },
+          ],
           hints: [
             'Try removing the duplicate targets, or changing the destination paths.',
           ],

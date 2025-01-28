@@ -1,6 +1,5 @@
 // @flow
-import type {FilePath} from '@parcel/types';
-import type {FileSystem} from './types';
+import type {FilePath, FileSystem} from '@parcel/types-internal';
 import path from 'path';
 
 export function findNodeModule(
@@ -36,9 +35,11 @@ export function findAncestorFile(
   fs: FileSystem,
   fileNames: Array<string>,
   dir: FilePath,
+  root: FilePath,
 ): ?FilePath {
-  let {root} = path.parse(dir);
-  while (dir !== root) {
+  let {root: pathRoot} = path.parse(dir);
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
     if (path.basename(dir) === 'node_modules') {
       return null;
     }
@@ -52,6 +53,10 @@ export function findAncestorFile(
       } catch (err) {
         // ignore
       }
+    }
+
+    if (dir === root || dir === pathRoot) {
+      break;
     }
 
     dir = path.dirname(dir);

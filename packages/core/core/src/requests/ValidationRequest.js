@@ -10,17 +10,18 @@ import ParcelConfig from '../ParcelConfig';
 import {report} from '../ReporterRunner';
 import Validation from '../Validation';
 import createParcelConfigRequest from './ParcelConfigRequest';
+import {requestTypes} from '../RequestTracker';
 
 type ValidationRequest = {|
   id: string,
-  +type: 'validation_request',
-  run: RunOpts => Async<void>,
+  +type: typeof requestTypes.validation_request,
+  run: (RunOpts<void>) => Async<void>,
   input: ValidationRequestInput,
 |};
 
-type RunOpts = {|
+type RunOpts<TResult> = {|
   input: ValidationRequestInput,
-  ...StaticRunOpts<void>,
+  ...StaticRunOpts<TResult>,
 |};
 
 type ValidationRequestInput = {|
@@ -33,7 +34,7 @@ export default function createValidationRequest(
 ): ValidationRequest {
   return {
     id: 'validation',
-    type: 'validation_request',
+    type: requestTypes.validation_request,
     run: async ({input: {assetRequests, optionsRef}, api, options, farm}) => {
       let {config: processedConfig, cachePath} = nullthrows(
         await api.runRequest<null, ConfigAndCachePath>(
@@ -41,23 +42,19 @@ export default function createValidationRequest(
         ),
       );
 
-      let config = new ParcelConfig(
-        processedConfig,
-        options.packageManager,
-        options.inputFS,
-        options.shouldAutoInstall,
-      );
+      let config = new ParcelConfig(processedConfig, options);
       let trackedRequestsDesc = assetRequests.filter(request => {
         return config.getValidatorNames(request.filePath).length > 0;
       });
 
       // Schedule validations on workers for all plugins that implement the one-asset-at-a-time "validate" method.
-      let promises = trackedRequestsDesc.map(async request =>
-        (await farm.createHandle('runValidate'))({
-          requests: [request],
-          optionsRef: optionsRef,
-          configCachePath: cachePath,
-        }),
+      let promises = trackedRequestsDesc.map(
+        async request =>
+          ((await farm.createHandle('runValidate'))({
+            requests: [request],
+            optionsRef: optionsRef,
+            configCachePath: cachePath,
+          }): void),
       );
 
       // Skip sending validation requests if no validators were configured

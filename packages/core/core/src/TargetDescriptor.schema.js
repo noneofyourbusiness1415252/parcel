@@ -35,6 +35,9 @@ export const PACKAGE_DESCRIPTOR_SCHEMA: SchemaObject = {
         'web-worker',
         'electron-main',
         'electron-renderer',
+        'service-worker',
+        'react-server',
+        'react-client',
       ],
     },
     includeNodeModules: {
@@ -71,6 +74,17 @@ export const PACKAGE_DESCRIPTOR_SCHEMA: SchemaObject = {
     isLibrary: {
       type: 'boolean',
     },
+    source: {
+      oneOf: [
+        {
+          type: 'string',
+        },
+        {
+          type: 'array',
+          items: {type: 'string'},
+        },
+      ],
+    },
     sourceMap: {
       oneOf: [
         {
@@ -94,7 +108,7 @@ export const PACKAGE_DESCRIPTOR_SCHEMA: SchemaObject = {
       ],
     },
     engines: ENGINES_SCHEMA,
-    minify: {
+    optimize: {
       type: 'boolean',
     },
     scopeHoist: {

@@ -1,11 +1,12 @@
 // @flow strict-local
 import ThrowableDiagnostic, {
   generateJSONCodeHighlights,
+  escapeMarkdown,
+  encodeJSONKeyComponent,
 } from '@parcel/diagnostic';
-import type {Mapping} from 'json-source-map';
+import type {Mapping} from '@mischnic/json-sourcemap';
 import nullthrows from 'nullthrows';
-// flowlint-next-line untyped-import:off
-import levenshtein from 'fastest-levenshtein';
+import * as levenshtein from 'fastest-levenshtein';
 
 export type SchemaEntity =
   | SchemaObject
@@ -210,7 +211,7 @@ function validateSchema(schema: SchemaEntity, data: mixed): Array<SchemaError> {
                   k =>
                     ({
                       type: 'forbidden-prop',
-                      dataPath: dataPath + '/' + k,
+                      dataPath: dataPath + '/' + encodeJSONKeyComponent(k),
                       dataType: 'key',
                       prop: k,
                       expectedProps: Object.keys(schemaNode.properties),
@@ -253,7 +254,7 @@ function validateSchema(schema: SchemaEntity, data: mixed): Array<SchemaError> {
                     [schemaNode.properties[k]].concat(schemaAncestors),
                     // $FlowFixMe type was already checked
                     dataNode[k],
-                    dataPath + '/' + k,
+                    dataPath + '/' + encodeJSONKeyComponent(k),
                   );
                   if (result) results.push(result);
                 } else {
@@ -262,7 +263,7 @@ function validateSchema(schema: SchemaEntity, data: mixed): Array<SchemaError> {
                       results.push({
                         type: 'enum',
                         dataType: 'key',
-                        dataPath: dataPath + '/' + k,
+                        dataPath: dataPath + '/' + encodeJSONKeyComponent(k),
                         expectedValues: Object.keys(
                           schemaNode.properties,
                         ).filter(
@@ -279,7 +280,7 @@ function validateSchema(schema: SchemaEntity, data: mixed): Array<SchemaError> {
                       [additionalProperties].concat(schemaAncestors),
                       // $FlowFixMe type was already checked
                       dataNode[k],
-                      dataPath + '/' + k,
+                      dataPath + '/' + encodeJSONKeyComponent(k),
                     );
                     if (result) results.push(result);
                   }
@@ -376,7 +377,7 @@ export function fuzzySearch(
   return result.map(([v]) => v);
 }
 
-validateSchema.diagnostic = function(
+validateSchema.diagnostic = function (
   schema: SchemaEntity,
   data: {|
     ...
@@ -404,7 +405,7 @@ validateSchema.diagnostic = function(
     !data
   ) {
     throw new Error(
-      'At least one of data.source and data.source must be defined!',
+      'At least one of data.source and data.data must be defined!',
     );
   }
   let object = data.map
@@ -476,25 +477,27 @@ validateSchema.diagnostic = function(
       map = data.source ?? JSON.stringify(nullthrows(data.data), 0, '\t');
       code = map;
     }
-    let codeFrame = {
-      code,
-      codeHighlights: generateJSONCodeHighlights(
-        map,
-        keys.map(({key, type, message}) => ({
-          key: (data.prependKey ?? '') + key,
-          type: type,
-          message,
-        })),
-      ),
-    };
+    let codeFrames = [
+      {
+        filePath: data.filePath ?? undefined,
+        language: 'json',
+        code,
+        codeHighlights: generateJSONCodeHighlights(
+          map,
+          keys.map(({key, type, message}) => ({
+            key: (data.prependKey ?? '') + key,
+            type: type,
+            message: message != null ? escapeMarkdown(message) : message,
+          })),
+        ),
+      },
+    ];
 
     throw new ThrowableDiagnostic({
       diagnostic: {
-        message,
+        message: message,
         origin,
-        filePath: data.filePath ?? undefined,
-        language: 'json',
-        codeFrame,
+        codeFrames,
       },
     });
   }

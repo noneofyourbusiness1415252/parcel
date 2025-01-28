@@ -3,32 +3,43 @@
 import type {
   Asset,
   BuildEvent,
+  BuildSuccessEvent,
   BundleGraph,
   Dependency,
   FilePath,
   InitialParcelOptions,
-  NamedBundle,
+  PackagedBundle,
 } from '@parcel/types';
 import type {FileSystem} from '@parcel/fs';
 import type WorkerFarm from '@parcel/workers';
+import type {IncomingMessage} from 'http';
 
 import invariant from 'assert';
 import util from 'util';
 import Parcel, {createWorkerFarm} from '@parcel/core';
 import assert from 'assert';
 import vm from 'vm';
+import v8 from 'v8';
 import {NodeFS, MemoryFS, OverlayFS, ncp as _ncp} from '@parcel/fs';
 import path from 'path';
 import url from 'url';
 import WebSocket from 'ws';
 import nullthrows from 'nullthrows';
-import postHtmlParse from 'posthtml-parser';
+import {parser as postHtmlParse} from 'posthtml-parser';
 import postHtml from 'posthtml';
+import EventEmitter from 'events';
+import http from 'http';
+import https from 'https';
 
-import {makeDeferredWithPromise, normalizeSeparators} from '@parcel/utils';
+import {
+  makeDeferredWithPromise,
+  normalizeSeparators,
+  loadConfig,
+} from '@parcel/utils';
 import _chalk from 'chalk';
 import resolve from 'resolve';
-import {NodePackageManager} from '@parcel/package-manager';
+
+export {fsFixture} from './fsFixture';
 
 export const workerFarm = (createWorkerFarm(): WorkerFarm);
 export const inputFS: NodeFS = new NodeFS();
@@ -100,31 +111,43 @@ If you don't know how, check here: https://bit.ly/2UmWsbD
   );
 }
 
+export function getParcelOptions(
+  entries: FilePath | Array<FilePath>,
+  opts?: $Shape<InitialParcelOptions>,
+): InitialParcelOptions {
+  return mergeParcelOptions(
+    {
+      entries,
+      shouldDisableCache: true,
+      logLevel: 'none',
+      shouldBundleIncrementally:
+        process.env.NO_INCREMENTAL == null ? true : false,
+      defaultConfig: path.join(__dirname, '.parcelrc-no-reporters'),
+      inputFS,
+      outputFS,
+      workerFarm,
+      shouldContentHash: true,
+      defaultTargetOptions: {
+        distDir,
+        engines: {
+          browsers: ['last 1 Chrome version'],
+          node: '18',
+        },
+      },
+    },
+    opts,
+  );
+}
+
 export function bundler(
   entries: FilePath | Array<FilePath>,
   opts?: $Shape<InitialParcelOptions>,
 ): Parcel {
-  return new Parcel({
-    entries,
-    shouldDisableCache: true,
-    logLevel: 'none',
-    defaultConfig: path.join(__dirname, '.parcelrc-no-reporters'),
-    inputFS,
-    outputFS,
-    workerFarm,
-    distDir,
-    packageManager: new NodePackageManager(opts?.inputFS || inputFS),
-    defaultEngines: {
-      browsers: ['last 1 Chrome version'],
-      node: '8',
-    },
-    shouldContentHash: true,
-    ...opts,
-  });
+  return new Parcel(getParcelOptions(entries, opts));
 }
 
 export function findAsset(
-  bundleGraph: BundleGraph<NamedBundle>,
+  bundleGraph: BundleGraph<PackagedBundle>,
   assetFileName: string,
 ): ?Asset {
   return bundleGraph.traverseBundles((bundle, context, actions) => {
@@ -142,31 +165,63 @@ export function findAsset(
 }
 
 export function findDependency(
-  bundleGraph: BundleGraph<NamedBundle>,
+  bundleGraph: BundleGraph<PackagedBundle>,
   assetFileName: string,
-  moduleSpecifier: string,
+  specifier: string,
 ): Dependency {
   let asset = nullthrows(
     findAsset(bundleGraph, assetFileName),
     `Couldn't find asset ${assetFileName}`,
   );
 
-  let dependency = bundleGraph
+  let dependencies = bundleGraph
     .getDependencies(asset)
-    .find(d => d.moduleSpecifier === moduleSpecifier);
+    .filter(d => d.specifier === specifier);
+
+  let dependency =
+    dependencies.length > 1
+      ? dependencies.find(d => !bundleGraph.isDependencySkipped(d))
+      : dependencies[0];
+
   invariant(
     dependency != null,
-    `Couldn't find dependency ${assetFileName} -> ${moduleSpecifier}`,
+    `Couldn't find dependency ${assetFileName} -> ${specifier}`,
   );
   return dependency;
 }
 
-export function assertDependencyWasDeferred(
-  bundleGraph: BundleGraph<NamedBundle>,
+export function mergeParcelOptions(
+  optsOne: InitialParcelOptions,
+  optsTwo?: InitialParcelOptions | null,
+): InitialParcelOptions {
+  if (!optsTwo) {
+    return optsOne;
+  }
+
+  return {
+    ...optsOne,
+    ...optsTwo,
+    // $FlowFixMe
+    defaultTargetOptions: {
+      ...optsOne?.defaultTargetOptions,
+      // $FlowFixMe
+      ...optsTwo?.defaultTargetOptions,
+    },
+    featureFlags: {
+      // $FlowFixMe
+      ...optsOne?.featureFlags,
+      // $FlowFixMe
+      ...optsTwo?.featureFlags,
+    },
+  };
+}
+
+export function assertDependencyWasExcluded(
+  bundleGraph: BundleGraph<PackagedBundle>,
   assetFileName: string,
-  moduleSpecifier: string,
+  specifier: string,
 ): void {
-  let dep = findDependency(bundleGraph, assetFileName, moduleSpecifier);
+  let dep = findDependency(bundleGraph, assetFileName, specifier);
   invariant(
     bundleGraph.isDependencySkipped(dep),
     util.inspect(dep) + " wasn't deferred",
@@ -176,7 +231,7 @@ export function assertDependencyWasDeferred(
 export async function bundle(
   entries: FilePath | Array<FilePath>,
   opts?: InitialParcelOptions,
-): Promise<BundleGraph<NamedBundle>> {
+): Promise<BundleGraph<PackagedBundle>> {
   return (await bundler(entries, opts).run()).bundleGraph;
 }
 
@@ -206,6 +261,14 @@ export function getNextBuild(b: Parcel): Promise<BuildEvent> {
   });
 }
 
+export async function getNextBuildSuccess(
+  b: Parcel,
+): Promise<BuildSuccessEvent> {
+  let evt = await getNextBuild(b);
+  invariant(evt.type === 'buildSuccess');
+  return evt;
+}
+
 export function shallowEqual(
   a: $Shape<{|+[string]: mixed|}>,
   b: $Shape<{|+[string]: mixed|}>,
@@ -223,101 +286,148 @@ export function shallowEqual(
   return true;
 }
 
-type RunOpts = {require?: boolean, ...};
+type RunOpts = {require?: boolean, strict?: boolean, entryAsset?: Asset, ...};
 
 export async function runBundles(
-  bundleGraph: BundleGraph<NamedBundle>,
-  parent: NamedBundle,
-  bundles: Array<NamedBundle>,
+  bundleGraph: BundleGraph<PackagedBundle>,
+  parent: PackagedBundle,
+  bundles: Array<[string, PackagedBundle]>,
   globals: mixed,
   opts: RunOpts = {},
   externalModules?: ExternalModules,
+  importMap?: ?ImportMap,
 ): Promise<mixed> {
-  let entryAsset = nullthrows(
-    bundles
-      .map(b => b.getMainEntry() || b.getEntryAssets()[0])
-      .filter(Boolean)[0],
-  );
+  let entryAsset =
+    opts.entryAsset ??
+    nullthrows(
+      bundles
+        .map(([, b]) => b.getMainEntry() || b.getEntryAssets()[0])
+        .filter(Boolean)[0],
+    );
   let env = entryAsset.env;
   let target = env.context;
   let outputFormat = env.outputFormat;
 
+  nodeCache.clear();
+
   let ctx, promises;
   switch (target) {
-    case 'browser': {
-      let prepared = prepareBrowserContext(parent.filePath, globals);
+    case 'browser':
+    case 'react-client': {
+      let prepared = prepareBrowserContext(parent, globals);
       ctx = prepared.ctx;
       promises = prepared.promises;
       break;
     }
     case 'node':
     case 'electron-main':
-      ctx = prepareNodeContext(
-        outputFormat === 'commonjs' && parent.filePath,
-        globals,
-      );
+    case 'react-server':
+      ctx = prepareNodeContext(globals);
       break;
     case 'electron-renderer': {
-      let browser = prepareBrowserContext(parent.filePath, globals);
-      ctx = {
-        ...browser.ctx,
-        ...prepareNodeContext(
-          outputFormat === 'commonjs' && parent.filePath,
-          globals,
-        ),
-      };
-      promises = browser.promises;
+      let prepared = prepareBrowserContext(parent, globals);
+      prepareNodeContext(globals, prepared.ctx);
+      ctx = prepared.ctx;
+      promises = prepared.promises;
+      break;
+    }
+    case 'web-worker':
+    case 'service-worker': {
+      let prepared = prepareWorkerContext(parent.filePath, globals);
+      ctx = prepared.ctx;
+      promises = prepared.promises;
+      break;
+    }
+    case 'worklet': {
+      ctx = Object.assign({}, globals);
       break;
     }
     default:
       throw new Error('Unknown target ' + target);
   }
 
+  // A utility to prevent optimizers from removing side-effect-free code needed for testing
+  // $FlowFixMe[prop-missing]
+  ctx.sideEffectNoop = v => v;
+
   vm.createContext(ctx);
   let esmOutput;
+  let cjsOutput;
   if (outputFormat === 'esmodule') {
-    invariant(bundles.length === 1, 'currently there can only be one bundle');
-    [esmOutput] = await runESM(
-      [nullthrows(bundles[0].filePath)],
+    let res = await runESM(
+      bundles[0][1].target.distDir,
+      bundles.map(([code, bundle]) => [code, bundle.filePath]),
       ctx,
       overlayFS,
       externalModules,
       true,
+      target === 'node' ||
+        target === 'electron-main' ||
+        target === 'react-server',
+      importMap,
     );
+
+    esmOutput = bundles.length === 1 ? res[0] : res;
+  } else if (outputFormat === 'commonjs' || env.isNode()) {
+    for (let [code, b] of bundles) {
+      let res = runModule(
+        b.target.distDir,
+        ctx,
+        b.filePath,
+        code,
+        externalModules,
+        opts.strict ?? false,
+      );
+      cjsOutput ??= res;
+    }
   } else {
-    invariant(
-      externalModules == null,
-      'externalModules are only supported with ESM',
-    );
-    for (let b of bundles) {
-      // require, parcelRequire was set up in prepare*Context
-      new vm.Script(await overlayFS.readFile(nullthrows(b.filePath), 'utf8'), {
-        filename: b.name,
+    for (let [code, b] of bundles) {
+      // parcelRequire was set up in prepare*Context
+      new vm.Script((opts.strict ? '"use strict";\n' : '') + code, {
+        filename:
+          b.bundleBehavior === 'inline'
+            ? b.name
+            : normalizeSeparators(path.relative(b.target.distDir, b.filePath)),
+        async importModuleDynamically(specifier) {
+          let filePath = path.resolve(path.dirname(parent.filePath), specifier);
+          let code = await overlayFS.readFile(filePath, 'utf8');
+          let modules = await runESM(
+            b.target.distDir,
+            [[code, filePath]],
+            ctx,
+            overlayFS,
+            externalModules,
+            true,
+            target === 'node' ||
+              target === 'electron-main' ||
+              target === 'react-server',
+            importMap,
+          );
+          return modules[0];
+        },
       }).runInContext(ctx);
     }
   }
+
   if (promises) {
     // await any ongoing dynamic imports during the run
     await Promise.all(promises);
   }
 
   if (opts.require !== false) {
+    if (!env.shouldScopeHoist) {
+      for (let key in ctx) {
+        if (key.startsWith('parcelRequire')) {
+          // $FlowFixMe[incompatible-use]
+          return ctx[key](bundleGraph.getAssetPublicId(entryAsset));
+        }
+      }
+    }
     switch (outputFormat) {
       case 'global':
-        if (env.scopeHoist) {
-          return typeof ctx.output !== 'undefined' ? ctx.output : undefined;
-        } else {
-          for (let key in ctx) {
-            if (key.startsWith('parcelRequire')) {
-              // $FlowFixMe[incompatible-use]
-              return ctx[key](bundleGraph.getAssetPublicId(entryAsset));
-            }
-          }
-        }
-        return;
+        return typeof ctx.output !== 'undefined' ? ctx.output : undefined;
       case 'commonjs':
-        invariant(typeof ctx.module === 'object' && ctx.module != null);
-        return ctx.module.exports;
+        return nullthrows(cjsOutput);
       case 'esmodule':
         return esmOutput;
       default:
@@ -331,43 +441,62 @@ export async function runBundles(
 }
 
 export async function runBundle(
-  bundleGraph: BundleGraph<NamedBundle>,
-  bundle: NamedBundle,
+  bundleGraph: BundleGraph<PackagedBundle>,
+  bundle: PackagedBundle,
   globals: mixed,
   opts: RunOpts = {},
   externalModules?: ExternalModules,
 ): Promise<mixed> {
   if (bundle.type === 'html') {
-    let code = await overlayFS.readFile(nullthrows(bundle.filePath));
+    let code = await overlayFS.readFile(nullthrows(bundle.filePath), 'utf8');
     let ast = postHtmlParse(code, {
       lowerCaseAttributeNames: true,
     });
 
+    let bundles = bundleGraph.getBundles({includeInline: true});
     let scripts = [];
+    let importMap: ?ImportMap = null;
     postHtml().walk.call(ast, node => {
-      if (node.tag === 'script') {
+      if (node.attrs?.nomodule != null) {
+        return node;
+      }
+      if (node.tag === 'script' && node.attrs?.src) {
         let src = url.parse(nullthrows(node.attrs).src);
         if (src.hostname == null) {
-          scripts.push(path.join(distDir, nullthrows(src.pathname)));
+          let p = path.join(distDir, nullthrows(src.pathname));
+          let b = nullthrows(bundles.find(b => b.filePath === p));
+          scripts.push([overlayFS.readFileSync(b.filePath, 'utf8'), b]);
         }
+      } else if (
+        node.tag === 'script' &&
+        node.content &&
+        node.attrs?.type === 'importmap'
+      ) {
+        importMap = JSON.parse(node.content.join(''));
+      } else if (node.tag === 'script' && node.content && !node.attrs?.src) {
+        let content = node.content.join('');
+        let inline = bundles.filter(
+          b => b.bundleBehavior === 'inline' && b.type === 'js',
+        );
+        scripts.push([content, inline[0]]);
       }
       return node;
     });
 
-    let bundles = bundleGraph.getBundles();
     return runBundles(
       bundleGraph,
       bundle,
-      scripts.map(p => nullthrows(bundles.find(b => b.filePath === p))),
+      scripts,
       globals,
       opts,
       externalModules,
+      importMap,
     );
   } else {
     return runBundles(
       bundleGraph,
       bundle,
-      [bundle],
+      [[overlayFS.readFileSync(bundle.filePath, 'utf8'), bundle]],
       globals,
       opts,
       externalModules,
@@ -376,7 +505,7 @@ export async function runBundle(
 }
 
 export function run(
-  bundleGraph: BundleGraph<NamedBundle>,
+  bundleGraph: BundleGraph<PackagedBundle>,
   globals: mixed,
   opts: RunOpts = {},
   externalModules?: ExternalModules,
@@ -389,12 +518,13 @@ export function run(
 }
 
 export function assertBundles(
-  bundleGraph: BundleGraph<NamedBundle>,
+  bundleGraph: BundleGraph<PackagedBundle>,
   expectedBundles: Array<{|
     name?: string | RegExp,
     type?: string,
     assets: Array<string>,
   |}>,
+  opts?: {|skipNodeModules?: boolean, skipHelpers?: boolean|},
 ) {
   let actualBundles = [];
   const byAlphabet = (a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1);
@@ -403,13 +533,42 @@ export function assertBundles(
     let assets = [];
 
     bundle.traverseAssets(asset => {
+      if (/@swc[/\\]helpers/.test(asset.filePath)) {
+        // Skip all helpers for now, as they add friction and churn to assertions.
+        // A longer term solution might have an explicit opt-in to this behavior, or
+        // if we enable symbol propagation unconditionally, the set of helpers
+        // should be more minimal.
+        return;
+      }
+
+      if (/runtime-[a-z0-9]{16}\.js/.test(asset.filePath)) {
+        // Skip runtime assets, which have hashed filenames for source maps.
+        return;
+      }
+
+      if (opts?.skipNodeModules && /node_modules/.test(asset.filePath)) {
+        return;
+      }
+
+      if (
+        (opts?.skipHelpers || opts?.skipNodeModules) &&
+        /esmodule-helpers.js|jsx-dev-runtime.js|jsx-runtime.js|rsc-helpers.js/.test(
+          asset.filePath,
+        )
+      ) {
+        return;
+      }
+
       const name = path.basename(asset.filePath);
       assets.push(name);
     });
 
     assets.sort(byAlphabet);
     actualBundles.push({
-      name: path.basename(nullthrows(bundle.filePath)),
+      name:
+        bundle.bundleBehavior === 'inline'
+          ? bundle.name
+          : path.basename(bundle.filePath),
       type: bundle.type,
       assets,
     });
@@ -424,48 +583,50 @@ export function assertBundles(
     bundle.assets.sort(byAlphabet);
   }
 
-  const byName = (a, b) => {
-    if (typeof a.name === 'string' && typeof b.name === 'string') {
-      return a.name.localeCompare(b.name);
-    }
-
-    return 0;
-  };
-
-  const byAssets = (a, b) =>
-    a.assets.join(',').localeCompare(b.assets.join(','));
-  expectedBundles.sort(byName).sort(byAssets);
-  actualBundles.sort(byName).sort(byAssets);
   assert.equal(
     actualBundles.length,
     expectedBundles.length,
-    'expected number of bundles mismatched',
+    `expected number of bundles mismatched\n\nActual bundles: \n\n${util.inspect(
+      actualBundles,
+    )}`,
   );
 
-  let i = 0;
   for (let bundle of expectedBundles) {
-    let actualBundle = actualBundles[i++];
     let name = bundle.name;
-    if (name != null) {
-      if (typeof name === 'string') {
-        assert.equal(actualBundle.name, name);
-      } else if (name instanceof RegExp) {
-        assert(
-          actualBundle.name.match(name),
-          `${actualBundle.name} does not match regexp ${name.toString()}`,
-        );
-      } else {
-        // $FlowFixMe[incompatible-call]
-        assert.fail();
+    let found = actualBundles.some(b => {
+      if (name != null && b.name != null) {
+        if (typeof name === 'string') {
+          if (name !== b.name) {
+            return false;
+          }
+        } else if (name instanceof RegExp) {
+          if (!name.test(b.name)) {
+            return false;
+          }
+        } else {
+          // $FlowFixMe[incompatible-call]
+          assert.fail('Expected bundle name has invalid type');
+        }
       }
-    }
 
-    if (bundle.type != null) {
-      assert.equal(actualBundle.type, bundle.type);
-    }
+      if (bundle.type != null && bundle.type !== b.type) {
+        return false;
+      }
 
-    if (bundle.assets) {
-      assert.deepEqual(actualBundle.assets, bundle.assets);
+      return (
+        bundle.assets &&
+        bundle.assets.length === b.assets.length &&
+        bundle.assets.every((a, i) => a === b.assets[i])
+      );
+    });
+
+    if (!found) {
+      // $FlowFixMe[incompatible-call]
+      assert.fail(
+        `Could not find expected bundle: \n\n${util.inspect(
+          bundle,
+        )} \n\nActual bundles: \n\n${util.inspect(actualBundles)}`,
+      );
     }
   }
 }
@@ -475,7 +636,7 @@ export function normaliseNewlines(text: string): string {
 }
 
 function prepareBrowserContext(
-  filePath: FilePath,
+  bundle: PackagedBundle,
   globals: mixed,
 ): {|
   ctx: vm$Context,
@@ -494,14 +655,17 @@ function prepareBrowserContext(
       if (el.tag === 'script') {
         let {deferred, promise} = makeDeferredWithPromise();
         promises.push(promise);
-        setTimeout(function() {
-          vm.runInContext(
-            overlayFS.readFileSync(
-              path.join(path.dirname(filePath), url.parse(el.src).pathname),
-              'utf8',
-            ),
-            ctx,
-          );
+        setTimeout(function () {
+          let pathname = url.parse(el.src).pathname;
+          let file = path.join(bundle.target.distDir, pathname);
+
+          new vm.Script(
+            // '"use strict";\n' +
+            overlayFS.readFileSync(file, 'utf8'),
+            {
+              filename: pathname.slice(1),
+            },
+          ).runInContext(ctx);
 
           el.onload();
           deferred.resolve();
@@ -529,8 +693,8 @@ function prepareBrowserContext(
       return {timeStamp: Date.now()};
     },
 
-    getElementById() {
-      return fakeElement;
+    getElementById(id) {
+      if (id !== '__parcel__error__overlay__') return fakeElement;
     },
 
     body: {
@@ -538,20 +702,162 @@ function prepareBrowserContext(
         return null;
       },
     },
-    currentScript: {
-      src: 'http://localhost/script.js',
-    },
+
+    currentScript: null,
   };
 
-  var exports = {};
+  function PatchedError(message) {
+    const patchedError = new Error(message);
+    const stackStart = patchedError.stack.match(/at (new )?Error/)?.index;
+    const stackEnd = patchedError.stack.includes('at Script.runInContext')
+      ? patchedError.stack.indexOf('at Script.runInContext')
+      : patchedError.stack.indexOf('at runNextTicks');
+    const stack = patchedError.stack.slice(stackStart, stackEnd).split('\n');
+    stack.shift();
+    stack.pop();
+    for (let [i, line] of stack.entries()) {
+      stack[i] = line.replace(
+        /( ?.* )\(?(.*)\)?$/,
+        (_, prefix, path) =>
+          prefix +
+          (path.endsWith(')')
+            ? `(http://localhost/${path.slice(0, path.length - 1)})`
+            : `http://localhost/${path}`),
+      );
+    }
+    patchedError.stack =
+      patchedError.stack.slice(0, stackStart).replace(/ +$/, '') +
+      stack.join('\n');
+
+    return patchedError;
+  }
+
+  PatchedError.prototype = Object.create(Error.prototype);
+  Object.defineProperty(PatchedError, 'name', {
+    writable: true,
+    value: 'Error',
+  });
+  PatchedError.prototype.constructor = PatchedError;
+
   var ctx = Object.assign(
     {
-      exports,
-      module: {exports},
+      Error: PatchedError,
       document: fakeDocument,
       WebSocket,
+      TextEncoder,
+      TextDecoder,
+      console: {...console, clear: () => {}},
+      location: {
+        hostname: 'localhost',
+        origin: 'http://localhost',
+        protocol: 'http',
+      },
+      navigator: {
+        userAgent: '',
+      },
+      fetch(url) {
+        return Promise.resolve({
+          async arrayBuffer() {
+            let readFilePromise = overlayFS.readFile(
+              path.join(path.dirname(bundle.target.distDir), url),
+            );
+            promises.push(readFilePromise);
+            return new Uint8Array(await readFilePromise).buffer;
+          },
+          text() {
+            let readFilePromise = overlayFS.readFile(
+              path.join(path.dirname(bundle.target.distDir), url),
+              'utf8',
+            );
+            promises.push(readFilePromise);
+            return readFilePromise;
+          },
+        });
+      },
+      atob(str) {
+        return Buffer.from(str, 'base64').toString('binary');
+      },
+      btoa(str) {
+        return Buffer.from(str, 'binary').toString('base64');
+      },
+      URL,
+      Worker: createWorkerClass(bundle.filePath),
+      addEventListener() {},
+      removeEventListener() {},
+    },
+    globals,
+  );
+
+  ctx.window = ctx.self = ctx;
+  return {ctx, promises};
+}
+
+function createWorkerClass(filePath: FilePath) {
+  return class Worker extends EventEmitter {
+    constructor(url) {
+      super();
+      this._run(url);
+    }
+
+    async _run(url) {
+      let u = new URL(url);
+      let filename = path.join(path.dirname(filePath), u.pathname);
+      let {ctx, promises} = prepareWorkerContext(filename, {
+        postMessage: msg => {
+          this.emit('message', msg);
+        },
+      });
+
+      let code = await overlayFS.readFile(filename, 'utf8');
+      vm.createContext(ctx);
+      new vm.Script(code, {
+        filename: 'http://localhost/' + path.basename(filename),
+      }).runInContext(ctx);
+
+      if (promises) {
+        await Promise.all(promises);
+      }
+    }
+
+    addEventListener(evt, callback) {
+      super.on(evt, callback);
+    }
+
+    removeEventListener(evt, callback) {
+      super.removeListener(evt, callback);
+    }
+  };
+}
+
+function prepareWorkerContext(
+  filePath: FilePath,
+  globals: mixed,
+): {|
+  ctx: vm$Context,
+  promises: Array<Promise<mixed>>,
+|} {
+  let promises = [];
+
+  var ctx = Object.assign(
+    {
+      WebSocket,
       console,
+      TextEncoder,
+      TextDecoder,
       location: {hostname: 'localhost', origin: 'http://localhost'},
+      importScripts(...urls) {
+        for (let u of urls) {
+          new vm.Script(
+            overlayFS.readFileSync(
+              path.join(path.dirname(filePath), url.parse(u).pathname),
+              'utf8',
+            ),
+            {
+              filename: path.basename(url.parse(u).pathname),
+            },
+          ).runInContext(ctx);
+        }
+      },
       fetch(url) {
         return Promise.resolve({
           async arrayBuffer() {
@@ -578,6 +884,7 @@ function prepareBrowserContext(
         return Buffer.from(str, 'binary').toString('base64');
       },
       URL,
+      Worker: createWorkerClass(filePath),
     },
     globals,
   );
@@ -586,13 +893,91 @@ function prepareBrowserContext(
   return {ctx, promises};
 }
 
-const nodeCache = {};
-// no filepath = ESM
-function prepareNodeContext(filePath, globals) {
-  let exports = {};
+const nodeCache = new Map();
+function prepareNodeContext(
+  globals,
+  // $FlowFixMe
+  ctx: any = {},
+) {
+  ctx.console = console;
+  ctx.process = process;
+  ctx.setTimeout = setTimeout;
+  ctx.setImmediate = setImmediate;
+  ctx.global = ctx;
+  ctx.URL = URL;
+  ctx.TextEncoder = TextEncoder;
+  ctx.TextDecoder = TextDecoder;
+  Object.assign(ctx, globals);
+  return ctx;
+}
+
+function runModule(
+  distDir: string,
+  // $FlowFixMe
+  ctx: any,
+  filePath: string,
+  code: string,
+  externalModules?: ExternalModules,
+  strict: boolean,
+) {
+  let cached = nodeCache.get(filePath);
+  if (cached) {
+    return cached.exports;
+  }
+
+  let f = vm.compileFunction(
+    (strict ? '"use strict";\n' : '') + code,
+    ['module', 'exports', '__filename', '__dirname', 'require'],
+    {
+      filename: path.basename(filePath),
+      parsingContext: ctx,
+      async importModuleDynamically(specifier) {
+        let resolved = path.resolve(path.dirname(filePath), specifier);
+        let code = await overlayFS.readFile(resolved, 'utf8');
+        if (path.extname(resolved) === '.mjs' || (await isESM(resolved))) {
+          let modules = await runESM(
+            distDir,
+            [[code, filePath]],
+            ctx,
+            overlayFS,
+            externalModules,
+            true,
+          );
+          return modules[0];
+        } else {
+          let mod = runModule(
+            distDir,
+            ctx,
+            resolved,
+            code,
+            externalModules,
+            strict,
+          );
+          // $FlowFixMe Experimental
+          let m = new vm.SyntheticModule(
+            Object.keys(mod),
+            function () {
+              for (let [k, v] of Object.entries(mod)) {
+                this.setExport(k, v);
+              }
+            },
+            {identifier: resolved, context: ctx},
+          );
+          await m.link(() => {});
+          await m.evaluate();
+          return m;
+        }
+      },
+    },
+  );
+
   let req =
     filePath &&
     (specifier => {
+      if (externalModules && specifier in externalModules) {
+        return externalModules[specifier](ctx);
+      }
+
       // $FlowFixMe[prop-missing]
       let res = resolve.sync(specifier, {
         basedir: path.dirname(filePath),
@@ -629,6 +1014,9 @@ function prepareNodeContext(filePath, globals) {
           readFileSync: (file, encoding) => {
             return overlayFS.readFileSync(file, encoding);
           },
+          existsSync: file => {
+            return overlayFS.existsSync(file);
+          },
         };
       }
 
@@ -637,54 +1025,76 @@ function prepareNodeContext(filePath, globals) {
         return require(specifier);
       }
 
-      if (nodeCache[res]) {
-        return nodeCache[res].module.exports;
+      if (path.extname(res) === '.css') {
+        return {};
       }
 
-      let ctx = prepareNodeContext(res, globals);
-      nodeCache[res] = ctx;
+      if (path.extname(res) === '.node') {
+        // $FlowFixMe[unsupported-syntax]
+        return require(res);
+      }
 
-      vm.createContext(ctx);
-      vm.runInContext(
-        '"use strict";\n' + overlayFS.readFileSync(res, 'utf8'),
+      return runModule(
+        distDir,
         ctx,
+        res,
+        overlayFS.readFileSync(res, 'utf8'),
+        externalModules,
+        strict,
       );
-      return ctx.module.exports;
     });
 
-  // $FlowFixMe any!
-  var ctx: any = {
-    ...(filePath && {
-      module: {exports, require: req},
-      exports,
-      __filename: filePath,
-      __dirname: path.dirname(filePath),
-      require: req,
-    }),
-    console,
-    process: process,
-    setTimeout: setTimeout,
-    setImmediate: setImmediate,
-    global: null,
-    ...globals,
-  };
-
-  ctx.global = ctx;
-  return ctx;
+  let exports = {};
+  let module = {exports, require: req};
+  nodeCache.set(filePath, module);
+  f(module, exports, filePath, path.dirname(filePath), req);
+  return module.exports;
 }
 
+async function isESM(filePath: string) {
+  let pkg = await loadConfig(overlayFS, filePath, ['package.json'], '/');
+  return pkg?.config?.type === 'module';
+}
+
+type ImportMap = {|
+  imports: {[string]: string},
+|};
+
+let instanceId = 0;
 export async function runESM(
-  entries: Array<string>,
+  baseDir: FilePath,
+  entries: Array<[string, string]>,
   context: vm$Context,
   fs: FileSystem,
   externalModules: ExternalModules = {},
   requireExtensions: boolean = false,
+  isNode: boolean = false,
+  importMap?: ?ImportMap,
 ): Promise<Array<{|[string]: mixed|}>> {
+  let id = instanceId++;
   let cache = new Map();
-  function load(specifier, referrer) {
+  function load(inputSpecifier, referrer, code = null) {
+    let specifier = inputSpecifier;
+    if (importMap) {
+      if (importMap.imports[inputSpecifier]) {
+        specifier = importMap.imports[inputSpecifier];
+      }
+    }
+
+    // ESM can request bundles with an absolute URL. Normalize this to the baseDir.
+    if (specifier.startsWith('/')) {
+      specifier = path.join(baseDir, specifier);
+    }
+    specifier = specifier.replace('http://localhost', baseDir);
+
     if (path.isAbsolute(specifier) || specifier.startsWith('.')) {
       let extname = path.extname(specifier);
-      if (extname && extname !== '.js' && extname !== '.mjs') {
+      if (
+        extname &&
+        extname !== '.js' &&
+        extname !== '.mjs' &&
+        extname !== '.css'
+      ) {
         throw new Error(
           'Unknown file extension in ' +
             specifier +
@@ -693,6 +1103,7 @@ export async function runESM(
         );
       }
       let filename = path.resolve(
+        baseDir,
         path.dirname(referrer.identifier),
         !extname && !requireExtensions ? specifier + '.js' : specifier,
       );
@@ -702,12 +1113,35 @@ export async function runESM(
         return m;
       }
 
-      let source = fs.readFileSync(filename, 'utf8');
+      let source =
+        code ??
+        (extname === '.css' ? '' : null) ??
+        fs.readFileSync(filename, 'utf8');
       // $FlowFixMe Experimental
       m = new vm.SourceTextModule(source, {
-        identifier: filename,
-        importModuleDynamically: entry,
+        identifier: `${normalizeSeparators(
+          path.relative(baseDir, filename),
+        )}?id=${id}`,
+        importModuleDynamically: (specifier, referrer) =>
+          entry(specifier, referrer),
         context,
+        initializeImportMeta(meta) {
+          if (isNode) {
+            meta.url = url.pathToFileURL(filename).toString();
+          } else {
+            meta.url = `http://localhost/${path.basename(filename)}`;
+          }
+
+          meta.resolve = inputSpecifier => {
+            let specifier = inputSpecifier;
+            if (importMap) {
+              if (importMap.imports[inputSpecifier]) {
+                specifier = importMap.imports[inputSpecifier];
+              }
+            }
+            return new URL(specifier, 'http://localhost').toString();
+          };
+        },
       });
       cache.set(filename, m);
       return m;
@@ -728,7 +1162,7 @@ export async function runESM(
       // $FlowFixMe Experimental
       m = new vm.SyntheticModule(
         Object.keys(ns),
-        function() {
+        function () {
           for (let [k, v] of Object.entries(ns)) {
             this.setExport(k, v);
           }
@@ -740,10 +1174,9 @@ export async function runESM(
     }
   }
 
-  async function entry(specifier, referrer) {
-    let m = load(specifier, referrer);
+  async function _entry(m) {
     if (m.status === 'unlinked') {
-      await m.link(load);
+      await m.link((specifier, referrer) => load(specifier, referrer));
     }
     if (m.status === 'linked') {
       await m.evaluate();
@@ -751,9 +1184,22 @@ export async function runESM(
     return m;
   }
 
+  let entryPromises = new Map();
+  function entry(specifier, referrer, code) {
+    let m = load(specifier, referrer, code);
+    let promise = entryPromises.get(m);
+    if (!promise) {
+      promise = _entry(m);
+      entryPromises.set(m, promise);
+    }
+    return promise;
+  }
+
   let modules = [];
-  for (let f of entries) {
-    modules.push(await entry(f, {identifier: ''}));
+  for (let [code, f] of entries) {
+    modules.push(
+      await entry('/' + path.relative(baseDir, f), {identifier: ''}, code),
+    );
   }
 
   for (let m of modules) {
@@ -766,7 +1212,7 @@ export async function runESM(
 }
 
 export async function assertESMExports(
-  b: BundleGraph<NamedBundle>,
+  b: BundleGraph<PackagedBundle>,
   expected: mixed,
   externalModules?: ExternalModules,
   // $FlowFixMe[unclear-type]
@@ -780,9 +1226,11 @@ export async function assertESMExports(
       .find(b => b.type === 'js')
       ?.getMainEntry(),
   );
+  nodeCache.clear();
   let [nodeResult] = await runESM(
-    [entry.filePath],
-    vm.createContext(prepareNodeContext(false, {})),
+    b.getBundles()[0].target.distDir,
+    [[await inputFS.readFile(entry.filePath, 'utf8'), entry.filePath]],
+    vm.createContext(prepareNodeContext({})),
     inputFS,
     externalModules,
   );
@@ -801,4 +1249,124 @@ export async function assertESMExports(
     parcelResult = {...parcelResult};
   }
   assert.deepEqual(parcelResult, expected);
+}
+
+export async function assertNoFilePathInCache(
+  fs: FileSystem,
+  dir: string,
+  projectRoot: string,
+) {
+  let entries = await fs.readdir(dir);
+  for (let entry of entries) {
+    // Skip watcher snapshots for linux/windows, which contain full file paths.
+    if (path.extname(entry) === '.txt') {
+      continue;
+    }
+
+    let fullPath = path.join(dir, entry);
+    let stat = await fs.stat(fullPath);
+    if (stat.isDirectory()) {
+      await assertNoFilePathInCache(fs, fullPath, projectRoot);
+    } else if (stat.isFile()) {
+      let contents = await fs.readFile(fullPath);
+
+      // For debugging purposes, log all instances of the projectRoot in the cache.
+      // Otherwise, fail the test if one is found.
+      if (process.env.PARCEL_DEBUG_CACHE_FILEPATH != null) {
+        if (contents.includes(projectRoot)) {
+          let deserialized;
+          try {
+            deserialized = v8.deserialize(contents);
+          } catch (err) {
+            // rudimentary detection of binary files
+            if (!contents.includes(0)) {
+              deserialized = contents.toString();
+            } else {
+              deserialized = contents;
+            }
+          }
+
+          if (deserialized != null) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `Found projectRoot ${projectRoot} in cache file ${fullPath}`,
+            );
+            // eslint-disable-next-line no-console
+            console.log(
+              require('util').inspect(deserialized, {depth: 50, colors: true}),
+            );
+          }
+        }
+      } else {
+        assert(
+          !contents.includes(projectRoot),
+          `Found projectRoot ${projectRoot} in cache file ${fullPath}`,
+        );
+      }
+    }
+  }
+}
+
+export function requestRaw(
+  file: string,
+  port: number,
+  options: ?requestOptions,
+  client: typeof http | typeof https = http,
+): Promise<{|res: IncomingMessage, data: string|}> {
+  return new Promise((resolve, reject) => {
+    client
+      // $FlowFixMe
+      .request(
+        {
+          hostname: 'localhost',
+          port: port,
+          path: file,
+          rejectUnauthorized: false,
+          ...options,
+        },
+        (res: IncomingMessage) => {
+          res.setEncoding('utf8');
+          let data = '';
+          res.on('data', c => (data += c));
+          res.on('end', () => {
+            if (res.statusCode !== 200) {
+              return reject({res, data});
+            }
+
+            resolve({res, data});
+          });
+        },
+      )
+      .end();
+  });
+}
+
+export function request(
+  file: string,
+  port: number,
+  client: typeof http | typeof https = http,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // $FlowFixMe
+    client.get(
+      {
+        hostname: 'localhost',
+        port: port,
+        path: file,
+        rejectUnauthorized: false,
+      },
+      res => {
+        res.setEncoding('utf8');
+        let data = '';
+        res.on('data', c => (data += c));
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            return reject({statusCode: res.statusCode, data});
+          }
+
+          resolve(data);
+        });
+      },
+    );
+  });
 }

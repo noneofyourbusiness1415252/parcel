@@ -2,34 +2,41 @@ const {Transform} = require('stream');
 const babel = require('gulp-babel');
 const gulp = require('gulp');
 const path = require('path');
-const rimraf = require('rimraf');
+const {rimraf} = require('rimraf');
+const swc = require('@swc/core');
 const babelConfig = require('./babel.config.json');
 
 const IGNORED_PACKAGES = [
   '!packages/examples/**',
   '!packages/core/integration-tests/**',
   '!packages/core/workers/test/integration/**',
-  '!packages/core/is-v2-ready-yet/**',
   '!packages/core/test-utils/**',
   '!packages/core/types/**',
-  '!packages/utils/node-libs-browser/**',
+  '!packages/core/types-internal/**',
+
+  // These packages are bundled.
+  '!packages/core/codeframe/**',
+  '!packages/core/fs/**',
+  '!packages/core/package-manager/**',
+  '!packages/core/utils/**',
+  '!packages/reporters/cli/**',
+  '!packages/reporters/dev-server/**',
 ];
 
 const paths = {
   packageSrc: [
     'packages/*/*/src/**/*.js',
-    '!packages/*/scope-hoisting/src/helpers.js',
-    '!**/loaders/**',
-    '!**/prelude.js',
+    '!**/dev-prelude.js',
     ...IGNORED_PACKAGES,
   ],
-  packageOther: [
-    'packages/*/scope-hoisting/src/helpers.js',
-    'packages/*/*/src/**/loaders/**',
-    'packages/*/*/src/**/prelude.js',
-    'packages/*/dev-server/src/templates/**',
+  packageOther: ['packages/*/*/src/**/dev-prelude.js'],
+  packageJson: [
+    'packages/core/parcel/package.json',
+    'packages/utils/create-react-app/package.json',
+    'packages/utils/create-parcel/package.json',
+    'packages/dev/query/package.json',
+    'packages/dev/bundle-stats-cli/package.json',
   ],
-  packageJson: 'packages/core/parcel/package.json',
   packages: 'packages/',
 };
 
@@ -54,19 +61,27 @@ class TapStream extends Transform {
 }
 
 exports.clean = function clean(cb) {
-  rimraf('packages/*/*/lib/**', cb);
+  rimraf('packages/*/*/lib/**').then(
+    () => cb(),
+    err => cb(err),
+  );
 };
 
 exports.default = exports.build = gulp.series(
-  gulp.parallel(buildBabel, copyOthers),
+  gulp.parallel(buildBabel, buildRSC, copyOthers),
   // Babel reads from package.json so update these after babel has run
-  () => updatePackageJson(paths.packageJson),
+  paths.packageJson.map(
+    packageJsonPath =>
+      function updatePackageJson() {
+        return _updatePackageJson(packageJsonPath);
+      },
+  ),
 );
 
 function buildBabel() {
   return gulp
     .src(paths.packageSrc)
-    .pipe(babel(babelConfig))
+    .pipe(babel({...babelConfig, babelrcRoots: [__dirname + '/packages/*/*']}))
     .pipe(renameStream(relative => relative.replace('src', 'lib')))
     .pipe(gulp.dest(paths.packages));
 }
@@ -78,7 +93,34 @@ function copyOthers() {
     .pipe(gulp.dest(paths.packages));
 }
 
-function updatePackageJson(file) {
+function buildRSC() {
+  return gulp
+    .src('packages/utils/rsc/src/*.tsx')
+    .pipe(
+      new TapStream(vinyl => {
+        let result = swc.transformSync(vinyl.contents.toString(), {
+          filename: vinyl.path,
+          jsc: {
+            parser: {
+              syntax: 'typescript',
+              tsx: true,
+            },
+            target: 'esnext',
+            experimental: {
+              emitIsolatedDts: true,
+            },
+          },
+        });
+
+        let output = JSON.parse(result.output);
+        vinyl.contents = Buffer.from(output.__swc_isolated_declarations__);
+      }),
+    )
+    .pipe(renameStream(relative => relative.replace('.tsx', '.d.ts')))
+    .pipe(gulp.dest('packages/utils/rsc/lib'));
+}
+
+function _updatePackageJson(file) {
   return gulp
     .src(file)
     .pipe(

@@ -4,31 +4,28 @@ import {Transformer} from '@parcel/plugin';
 import path from 'path';
 import SourceMap from '@parcel/source-map';
 import type {DiagnosticCodeFrame} from '@parcel/diagnostic';
-
-import typeof TypeScriptModule from 'typescript'; // eslint-disable-line import/no-extraneous-dependencies
 import type {CompilerOptions} from 'typescript';
+
+import ts from 'typescript';
 import {CompilerHost, loadTSConfig} from '@parcel/ts-utils';
+import {normalizeSeparators} from '@parcel/utils';
+import ThrowableDiagnostic, {escapeMarkdown} from '@parcel/diagnostic';
 import {TSModuleGraph} from './TSModuleGraph';
 import nullthrows from 'nullthrows';
 import {collect} from './collect';
 import {shake} from './shake';
 
 export default (new Transformer({
-  async loadConfig({config, options}) {
-    await loadTSConfig(config, options);
+  loadConfig({config, options}) {
+    return loadTSConfig(config, options);
   },
 
-  async transform({asset, config, options, logger}) {
-    let ts: TypeScriptModule = await options.packageManager.require(
-      'typescript',
-      asset.filePath,
-      {shouldAutoInstall: options.shouldAutoInstall},
-    );
-
+  transform({asset, config, options, logger}) {
     let opts: CompilerOptions = {
       // React is the default. Users can override this by supplying their own tsconfig,
       // which many TypeScript users will already have for typechecking, etc.
       jsx: ts.JsxEmit.React,
+      moduleResolution: ts.ModuleResolutionKind.NodeJs,
       ...config,
       // Always emit output
       noEmit: false,
@@ -38,36 +35,39 @@ export default (new Transformer({
       isolatedModules: false,
       emitDeclarationOnly: true,
       outFile: 'index.d.ts',
-      moduleResolution: ts.ModuleResolutionKind.NodeJs,
       // createProgram doesn't support incremental mode
       composite: false,
+      incremental: false,
     };
 
     let host = new CompilerHost(options.inputFS, ts, logger);
     // $FlowFixMe
     let program = ts.createProgram([asset.filePath], opts, host);
 
-    let includedFiles = program
-      .getSourceFiles()
-      .filter(file => path.normalize(file.fileName) !== asset.filePath)
-      .map(file => ({
-        filePath: host.redirectTypes.get(file.fileName) ?? file.fileName,
-      }));
+    for (let file of program.getSourceFiles()) {
+      if (path.normalize(file.fileName) !== asset.filePath) {
+        asset.invalidateOnFileChange(
+          host.redirectTypes.get(file.fileName) ?? file.fileName,
+        );
+      }
+    }
 
-    let mainModuleName = path
-      .relative(program.getCommonSourceDirectory(), asset.filePath)
-      .slice(0, -path.extname(asset.filePath).length);
-    let moduleGraph = new TSModuleGraph(ts, mainModuleName);
+    let mainModuleName = normalizeSeparators(
+      path
+        .relative(program.getCommonSourceDirectory(), asset.filePath)
+        .slice(0, -path.extname(asset.filePath).length),
+    );
+    let moduleGraph = new TSModuleGraph(mainModuleName);
 
     let emitResult = program.emit(undefined, undefined, undefined, true, {
       afterDeclarations: [
         // 1. Build module graph
         context => sourceFile => {
-          return collect(ts, moduleGraph, context, sourceFile);
+          return collect(moduleGraph, context, sourceFile);
         },
         // 2. Tree shake and rename types
         context => sourceFile => {
-          return shake(ts, moduleGraph, context, sourceFile);
+          return shake(moduleGraph, context, sourceFile);
         },
       ],
     });
@@ -76,67 +76,90 @@ export default (new Transformer({
       .getPreEmitDiagnostics(program)
       .concat(emitResult.diagnostics);
 
-    if (diagnostics.length > 0) {
-      for (let diagnostic of diagnostics) {
-        let filename = asset.filePath;
-        let {file} = diagnostic;
+    let diagnosticIds = new Set();
+    let deduplicatedDiagnostics = [];
+    for (let d of diagnostics) {
+      if (d.start != null && d.length != null && d.messageText != null) {
+        let id = `${d.start}:${d.length}:${ts.flattenDiagnosticMessageText(
+          d.messageText,
+          '\n',
+        )}`;
+        if (!diagnosticIds.has(id)) {
+          deduplicatedDiagnostics.push(d);
+        }
+        diagnosticIds.add(id);
+      } else {
+        deduplicatedDiagnostics.push(d);
+      }
+    }
 
-        let diagnosticMessage =
-          typeof diagnostic.messageText === 'string'
-            ? diagnostic.messageText
-            : diagnostic.messageText.messageText;
+    let parcelDiagnostics = deduplicatedDiagnostics.map(diagnostic => {
+      let filename = asset.filePath;
+      let {file} = diagnostic;
 
-        let codeframe: ?DiagnosticCodeFrame;
-        if (file != null && diagnostic.start != null) {
-          let source = file.text || diagnostic.source;
-          if (file.fileName) {
-            filename = file.fileName;
-          }
+      let diagnosticMessage = ts.flattenDiagnosticMessageText(
+        diagnostic.messageText,
+        '\n',
+      );
 
-          // $FlowFixMe
-          if (source) {
-            let lineChar = file.getLineAndCharacterOfPosition(diagnostic.start);
-            let start = {
-              line: lineChar.line + 1,
-              column: lineChar.character + 1,
-            };
-            let end = {
-              line: start.line,
-              column: start.column + 1,
-            };
-
-            if (
-              typeof diagnostic.start === 'number' &&
-              typeof diagnostic.length === 'number'
-            ) {
-              let endCharPosition = file.getLineAndCharacterOfPosition(
-                diagnostic.start + diagnostic.length,
-              );
-
-              end = {
-                line: endCharPosition.line + 1,
-                column: endCharPosition.character + 1,
-              };
-            }
-
-            codeframe = {
-              code: source,
-              codeHighlights: [
-                {
-                  start,
-                  end,
-                  message: diagnosticMessage,
-                },
-              ],
-            };
-          }
+      let codeframe: ?DiagnosticCodeFrame;
+      if (file != null && diagnostic.start != null) {
+        let source = file.text || diagnostic.source;
+        if (file.fileName) {
+          filename = file.fileName;
         }
 
-        logger.warn({
-          message: diagnosticMessage,
-          filePath: filename,
-          codeFrame: codeframe ? codeframe : undefined,
-        });
+        // $FlowFixMe
+        if (source) {
+          let lineChar = file.getLineAndCharacterOfPosition(diagnostic.start);
+          let start = {
+            line: lineChar.line + 1,
+            column: lineChar.character + 1,
+          };
+          let end = {
+            line: start.line,
+            column: start.column + 1,
+          };
+
+          if (
+            typeof diagnostic.start === 'number' &&
+            typeof diagnostic.length === 'number'
+          ) {
+            let endCharPosition = file.getLineAndCharacterOfPosition(
+              diagnostic.start + diagnostic.length,
+            );
+
+            end = {
+              line: endCharPosition.line + 1,
+              column: endCharPosition.character,
+            };
+          }
+
+          codeframe = {
+            filePath: filename,
+            code: source,
+            codeHighlights: [
+              {
+                start,
+                end,
+                message: escapeMarkdown(diagnosticMessage),
+              },
+            ],
+          };
+        }
+      }
+
+      return {
+        message: escapeMarkdown(diagnosticMessage),
+        codeFrames: codeframe ? [codeframe] : undefined,
+      };
+    });
+
+    if (host.outputCode == null) {
+      throw new ThrowableDiagnostic({diagnostic: parcelDiagnostics});
+    } else {
+      for (let d of parcelDiagnostics) {
+        logger.warn(d);
       }
     }
 
@@ -151,18 +174,12 @@ export default (new Transformer({
     let sourceMap = null;
     if (map.mappings) {
       sourceMap = new SourceMap(options.projectRoot);
-      sourceMap.addRawMappings(map);
+      sourceMap.addVLQMap(map);
     }
 
-    return [
-      {
-        type: 'ts',
-        // Stay on the types pipeline, even if the type changes
-        pipeline: asset.pipeline,
-        content: code,
-        map: sourceMap,
-        includedFiles,
-      },
-    ];
+    asset.type = 'ts';
+    asset.setCode(code);
+    asset.setMap(sourceMap);
+    return [asset];
   },
 }): Transformer);

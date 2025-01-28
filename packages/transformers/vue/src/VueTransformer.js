@@ -1,13 +1,22 @@
 // @flow strict-local
+import type {TransformerResult} from '@parcel/types';
+
 import {Transformer} from '@parcel/plugin';
 import nullthrows from 'nullthrows';
-import {md5FromObject} from '@parcel/utils';
-import ThrowableDiagnostic from '@parcel/diagnostic';
-import type {Diagnostic} from '@parcel/diagnostic';
-import type {TransformerResult} from '@parcel/types';
+import {hashObject} from '@parcel/utils';
+import ThrowableDiagnostic, {
+  type Diagnostic,
+  convertSourceLocationToHighlight,
+  escapeMarkdown,
+  md,
+} from '@parcel/diagnostic';
 import SourceMap from '@parcel/source-map';
 import semver from 'semver';
 import {basename, extname, relative, dirname} from 'path';
+// $FlowFixMe
+import * as compiler from '@vue/compiler-sfc';
+// $FlowFixMe
+import consolidate from '@ladjs/consolidate';
 
 const MODULE_BY_NAME_RE = /\.module\./;
 
@@ -15,38 +24,43 @@ const MODULE_BY_NAME_RE = /\.module\./;
 export default (new Transformer({
   async loadConfig({config}) {
     let conf = await config.getConfig(
-      ['.vuerc', '.vuerc.json', '.vuerc.js', 'vue.config.js'],
+      [
+        '.vuerc',
+        '.vuerc.json',
+        '.vuerc.js',
+        '.vuerc.cjs',
+        '.vuerc.mjs',
+        'vue.config.js',
+        'vue.config.cjs',
+        'vue.config.mjs',
+      ],
       {packageKey: 'vue'},
     );
     let contents = {};
     if (conf) {
-      config.shouldInvalidateOnStartup();
+      config.invalidateOnStartup();
       contents = conf.contents;
       if (typeof contents !== 'object') {
+        // TODO: codeframe
         throw new ThrowableDiagnostic({
           diagnostic: {
             message: 'Vue config should be an object.',
             origin: '@parcel/transformer-vue',
-            filePath: conf.filePath,
           },
         });
       }
     }
-    config.setResult({
+    return {
       customBlocks: contents.customBlocks || {},
       filePath: conf && conf.filePath,
-    });
+      compilerOptions: contents.compilerOptions || {},
+    };
   },
   canReuseAST({ast}) {
     return ast.type === 'vue' && semver.satisfies(ast.version, '^3.0.0');
   },
   async parse({asset, options}) {
     // TODO: This parses the vue component multiple times. Fix?
-    let compiler = await options.packageManager.require(
-      '@vue/compiler-sfc',
-      asset.filePath,
-      {shouldAutoInstall: options.shouldAutoInstall},
-    );
     let code = await asset.getCode();
     let parsed = compiler.parse(code, {
       sourceMap: true,
@@ -60,22 +74,35 @@ export default (new Transformer({
       });
     }
 
+    const descriptor = parsed.descriptor;
+    let id = hashObject({
+      filePath: asset.filePath,
+      source: options.mode === 'production' ? code : null,
+    }).slice(-6);
+
     return {
       type: 'vue',
       version: '3.0.0',
-      program: parsed.descriptor,
+      program: {
+        ...descriptor,
+        script:
+          descriptor.script != null || descriptor.scriptSetup != null
+            ? compiler.compileScript(descriptor, {
+                id,
+                isProd: options.mode === 'production',
+              })
+            : null,
+        id,
+      },
     };
   },
   async transform({asset, options, resolve, config}) {
-    let baseId = md5FromObject({
-      filePath: asset.filePath,
-    }).slice(-6);
-    let scopeId = 'data-v-' + baseId;
-    let hmrId = baseId + '-hmr';
-    let basePath = basename(asset.filePath);
-    let {template, script, styles, customBlocks} = nullthrows(
+    let {template, script, styles, customBlocks, id} = nullthrows(
       await asset.getAST(),
     ).program;
+    let scopeId = 'data-v-' + id;
+    let hmrId = id + '-hmr';
+    let basePath = basename(asset.filePath);
     if (asset.pipeline != null) {
       return processPipeline({
         asset,
@@ -87,7 +114,7 @@ export default (new Transformer({
         basePath,
         options,
         resolve,
-        scopeId,
+        id,
         hmrId,
       });
     }
@@ -154,29 +181,21 @@ function createDiagnostic(err, filePath) {
       filePath,
     };
   }
+  // TODO: codeframe
   let diagnostic: Diagnostic = {
-    message: err.message,
+    message: escapeMarkdown(err.message),
     origin: '@parcel/transformer-vue',
     name: err.name,
     stack: err.stack,
-    filePath,
+    codeFrames: err.loc
+      ? [
+          {
+            filePath,
+            codeHighlights: [convertSourceLocationToHighlight(err.loc)],
+          },
+        ]
+      : [],
   };
-  if (err.loc) {
-    diagnostic.codeFrame = {
-      codeHighlights: [
-        {
-          start: {
-            line: err.loc.start.line + err.loc.start.offset,
-            column: err.loc.start.column,
-          },
-          end: {
-            line: err.loc.end.line + err.loc.end.offset,
-            column: err.loc.end.column,
-          },
-        },
-      ],
-    };
-  }
   return diagnostic;
 }
 
@@ -190,19 +209,9 @@ async function processPipeline({
   basePath,
   options,
   resolve,
-  scopeId,
+  id,
   hmrId,
 }) {
-  let compiler = await options.packageManager.require(
-    '@vue/compiler-sfc',
-    asset.filePath,
-    {shouldAutoInstall: options.shouldAutoInstall},
-  );
-  let consolidate = await options.packageManager.require(
-    'consolidate',
-    asset.filePath,
-    {shouldAutoInstall: options.shouldAutoInstall},
-  );
   switch (asset.pipeline) {
     case 'template': {
       let isFunctional = template.functional;
@@ -212,46 +221,41 @@ async function processPipeline({
             await resolve(asset.filePath, template.src),
           )
         ).toString();
-        template.lang = extname(template.src);
+        template.lang = extname(template.src).slice(1);
       }
       let content = template.content;
       if (template.lang && !['htm', 'html'].includes(template.lang)) {
+        let options = {};
         let preprocessor = consolidate[template.lang];
+        // Pug doctype fix (fixes #7756)
+        switch (template.lang) {
+          case 'pug':
+            options.doctype = 'html';
+            break;
+        }
         if (!preprocessor) {
+          // TODO: codeframe
           throw new ThrowableDiagnostic({
             diagnostic: {
-              message: `Unknown template language: "${template.lang}"`,
+              message: md`Unknown template language: "${template.lang}"`,
               origin: '@parcel/transformer-vue',
-              filePath: asset.filePath,
             },
           });
         }
-        // TODO: Improve? This seems brittle
-        try {
-          content = await preprocessor.render(content, {});
-        } catch (e) {
-          if (e.code !== 'MODULE_NOT_FOUND' || !options.shouldAutoInstall) {
-            throw e;
-          }
-          let firstIndex = e.message.indexOf("'");
-          let secondIndex = e.message.indexOf("'", firstIndex + 1);
-          let toInstall = e.message.slice(firstIndex + 1, secondIndex);
-
-          await options.packageManager.require(toInstall, asset.filePath, {
-            shouldAutoInstall: true,
-          });
-
-          content = await preprocessor.render(content, {});
-        }
+        content = await preprocessor.render(content, options);
       }
       let templateComp = compiler.compileTemplate({
         filename: asset.filePath,
         source: content,
         inMap: template.src ? undefined : template.map,
+        scoped: styles.some(style => style.scoped),
         isFunctional,
         compilerOptions: {
-          scopeId,
+          ...config.compilerOptions,
+          bindingMetadata: script ? script.bindings : undefined,
         },
+        isProd: options.mode === 'production',
+        id,
       });
       if (templateComp.errors.length) {
         throw new ThrowableDiagnostic({
@@ -289,7 +293,7 @@ ${
             await resolve(asset.filePath, script.src),
           )
         ).toString();
-        script.lang = extname(script.src);
+        script.lang = extname(script.src).slice(1);
       }
       let type;
       switch (script.lang || 'js') {
@@ -297,20 +301,26 @@ ${
         case 'js':
           type = 'js';
           break;
+        case 'jsx':
+          type = 'jsx';
+          break;
         case 'typescript':
         case 'ts':
           type = 'ts';
+          break;
+        case 'tsx':
+          type = 'tsx';
           break;
         case 'coffeescript':
         case 'coffee':
           type = 'coffee';
           break;
         default:
+          // TODO: codeframe
           throw new ThrowableDiagnostic({
             diagnostic: {
-              message: `Unknown script language: "${script.lang}"`,
+              message: md`Unknown script language: "${script.lang}"`,
               origin: '@parcel/transformer-vue',
-              filePath: asset.filePath,
             },
           });
       }
@@ -339,37 +349,25 @@ ${
             if (!style.module) {
               style.module = MODULE_BY_NAME_RE.test(style.src);
             }
-            style.lang = extname(style.src);
+            style.lang = extname(style.src).slice(1);
           }
-          let toInstall;
           switch (style.lang) {
             case 'less':
-              toInstall = 'less';
-              break;
             case 'stylus':
             case 'styl':
-              toInstall = 'stylus';
-              break;
             case 'scss':
             case 'sass':
-              toInstall = 'sass';
-              break;
             case 'css':
             case undefined:
               break;
             default:
+              // TODO: codeframe
               throw new ThrowableDiagnostic({
                 diagnostic: {
-                  message: `Unknown style language: "${style.lang}"`,
+                  message: md`Unknown style language: "${style.lang}"`,
                   origin: '@parcel/transformer-vue',
-                  filePath: asset.filePath,
                 },
               });
-          }
-          if (toInstall) {
-            await options.packageManager.require(toInstall, asset.filePath, {
-              shouldAutoInstall: options.shouldAutoInstall,
-            });
           }
           let styleComp = await compiler.compileStyleAsync({
             filename: asset.filePath,
@@ -377,8 +375,9 @@ ${
             modules: style.module,
             preprocessLang: style.lang || 'css',
             scoped: style.scoped,
-            map: style.src ? undefined : style.map,
-            id: scopeId,
+            inMap: style.src ? undefined : style.map,
+            isProd: options.mode === 'production',
+            id,
           });
           if (styleComp.errors.length) {
             throw new ThrowableDiagnostic({
@@ -436,11 +435,11 @@ export default cssModules;`,
       for (let block of customBlocks) {
         let {type, src, content, attrs} = block;
         if (!config.customBlocks[type]) {
+          // TODO: codeframe
           throw new ThrowableDiagnostic({
             diagnostic: {
-              message: `No preprocessor found for block type ${type}`,
+              message: md`No preprocessor found for block type ${type}`,
               origin: '@parcel/transformer-vue',
-              filePath: asset.filePath,
             },
           });
         }
@@ -464,7 +463,7 @@ ${(
       async type =>
         `import p${type} from './${relative(
           dirname(asset.filePath),
-          await resolve(config.filePath, config.customBlocks[type]),
+          await resolve(nullthrows(config.filePath), config.customBlocks[type]),
         )}';
 if (typeof p${type} !== 'function') {
   p${type} = NOOP;
@@ -493,6 +492,6 @@ export default script => {
 
 function createMap(rawMap, projectRoot: string) {
   let newMap = new SourceMap(projectRoot);
-  newMap.addRawMappings(rawMap);
+  newMap.addVLQMap(rawMap);
   return newMap;
 }

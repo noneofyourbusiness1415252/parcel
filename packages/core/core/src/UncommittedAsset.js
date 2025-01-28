@@ -3,42 +3,34 @@
 import type {
   AST,
   Blob,
-  ConfigResult,
   DependencyOptions,
-  FilePath,
-  PackageJSON,
+  FileCreateInvalidation,
+  GenerateOutput,
   PackageName,
   TransformerResult,
 } from '@parcel/types';
-import type {
-  Asset,
-  RequestInvalidation,
-  Dependency,
-  ParcelOptions,
-} from './types';
+import type {Asset, Dependency, ParcelOptions, Invalidations} from './types';
 
-import v8 from 'v8';
 import invariant from 'assert';
 import {Readable} from 'stream';
 import SourceMap from '@parcel/source-map';
 import {
-  bufferStream,
-  md5FromString,
   blobToStream,
+  bufferStream,
   streamFromPromise,
   TapStream,
   loadSourceMap,
   SOURCEMAP_RE,
 } from '@parcel/utils';
+import {hashString, hashBuffer, Hash} from '@parcel/rust';
+import {serializeRaw} from './serializer';
 import {createDependency, mergeDependencies} from './Dependency';
 import {mergeEnvironments} from './Environment';
 import {PARCEL_VERSION} from './constants';
-import {
-  createAsset,
-  getConfig,
-  getInvalidationId,
-  getInvalidationHash,
-} from './assetUtils';
+import {createAsset, createAssetIdFromOptions} from './assetUtils';
+import {BundleBehaviorNames} from './types';
+import {invalidateOnFileCreateToInternal, createInvalidations} from './utils';
+import {type ProjectPath, fromProjectPath} from './projectPath';
 
 type UncommittedAssetOptions = {|
   value: Asset,
@@ -48,7 +40,7 @@ type UncommittedAssetOptions = {|
   ast?: ?AST,
   isASTDirty?: ?boolean,
   idBase?: ?string,
-  invalidations?: Map<string, RequestInvalidation>,
+  invalidations?: Invalidations,
 |};
 
 export default class UncommittedAsset {
@@ -56,11 +48,14 @@ export default class UncommittedAsset {
   options: ParcelOptions;
   content: ?(Blob | Promise<Buffer>);
   mapBuffer: ?Buffer;
+  sourceContent: ?string;
   map: ?SourceMap;
   ast: ?AST;
   isASTDirty: boolean;
   idBase: ?string;
-  invalidations: Map<string, RequestInvalidation>;
+  invalidations: Invalidations;
+  generate: ?() => Promise<GenerateOutput>;
+  transformers: Set<string>;
 
   constructor({
     value,
@@ -79,14 +74,15 @@ export default class UncommittedAsset {
     this.ast = ast;
     this.isASTDirty = isASTDirty || false;
     this.idBase = idBase;
-    this.invalidations = invalidations || new Map();
+    this.invalidations = invalidations || createInvalidations();
+    this.transformers = new Set();
   }
 
   /*
-   * Prepares the asset for being serialized to the cache by commiting its
+   * Prepares the asset for being serialized to the cache by committing its
    * content and map of the asset to the cache.
    */
-  async commit(pipelineKey: string): Promise<void> {
+  async commit(): Promise<void> {
     // If there is a dirty AST, clear out any old content and map as these
     // must be regenerated later and shouldn't be committed.
     if (this.ast != null && this.isASTDirty) {
@@ -95,74 +91,72 @@ export default class UncommittedAsset {
     }
 
     let size = 0;
-    let contentKey =
-      this.content == null ? null : this.getCacheKey('content' + pipelineKey);
-    let mapKey =
-      this.mapBuffer == null ? null : this.getCacheKey('map' + pipelineKey);
-    let astKey =
-      this.ast == null ? null : this.getCacheKey('ast' + pipelineKey);
+    let outputHash = '';
+    let contentKey = this.content == null ? null : this.getCacheKey('content');
+    let mapKey = this.mapBuffer == null ? null : this.getCacheKey('map');
+    let astKey = this.ast == null ? null : this.getCacheKey('ast');
 
     // Since we can only read from the stream once, compute the content length
     // and hash while it's being written to the cache.
     await Promise.all([
       contentKey != null &&
-        this.commitContent(contentKey).then(s => (size = s)),
+        this.commitContent(contentKey).then(
+          s => ((size = s.size), (outputHash = s.hash)),
+        ),
       this.mapBuffer != null &&
         mapKey != null &&
         this.options.cache.setBlob(mapKey, this.mapBuffer),
       astKey != null &&
-        this.options.cache.setBlob(
-          astKey,
-          // $FlowFixMe
-          v8.serialize(this.ast),
-        ),
+        this.options.cache.setBlob(astKey, serializeRaw(this.ast)),
     ]);
     this.value.contentKey = contentKey;
     this.value.mapKey = mapKey;
     this.value.astKey = astKey;
-    this.value.outputHash = md5FromString(
-      [
-        this.value.hash,
-        pipelineKey,
-        await getInvalidationHash(this.getInvalidations(), this.options),
-      ].join(':'),
-    );
+    this.value.outputHash = outputHash;
 
     if (this.content != null) {
       this.value.stats.size = size;
     }
 
+    this.value.isLargeBlob = this.content instanceof Readable;
     this.value.committed = true;
   }
 
-  async commitContent(contentKey: string): Promise<number> {
+  async commitContent(
+    contentKey: string,
+  ): Promise<{|size: number, hash: string|}> {
     let content = await this.content;
     if (content == null) {
-      return 0;
+      return {size: 0, hash: ''};
     }
 
     let size = 0;
     if (content instanceof Readable) {
+      let hash = new Hash();
       await this.options.cache.setStream(
         contentKey,
         content.pipe(
           new TapStream(buf => {
+            hash.writeBuffer(buf);
             size += buf.length;
           }),
         ),
       );
 
-      return size;
+      return {size, hash: hash.finish()};
     }
 
+    let hash;
     if (typeof content === 'string') {
+      hash = hashString(content);
       size = Buffer.byteLength(content);
     } else {
+      hash = hashBuffer(content);
       size = content.length;
     }
 
     await this.options.cache.setBlob(contentKey, content);
-    return size;
+    return {size, hash};
   }
 
   async getCode(): Promise<string> {
@@ -187,7 +181,9 @@ export default class UncommittedAsset {
     let content = await this.content;
     if (content == null) {
       return Buffer.alloc(0);
-    } else if (typeof content === 'string' || content instanceof Buffer) {
+    } else if (content instanceof Buffer) {
+      return content;
+    } else if (typeof content === 'string') {
       return Buffer.from(content);
     }
 
@@ -231,10 +227,14 @@ export default class UncommittedAsset {
     }
 
     let code = await this.getCode();
-    let map = await loadSourceMap(this.value.filePath, code, {
-      fs: this.options.inputFS,
-      projectRoot: this.options.projectRoot,
-    });
+    let map = await loadSourceMap(
+      fromProjectPath(this.options.projectRoot, this.value.filePath),
+      code,
+      {
+        fs: this.options.inputFS,
+        projectRoot: this.options.projectRoot,
+      },
+    );
 
     if (map) {
       this.map = map;
@@ -254,9 +254,7 @@ export default class UncommittedAsset {
       let mapBuffer = this.mapBuffer ?? (await this.getMapBuffer());
       if (mapBuffer) {
         // Get sourcemap from flatbuffer
-        let map = new SourceMap(this.options.projectRoot);
-        map.addBufferMappings(mapBuffer);
-        this.map = map;
+        this.map = new SourceMap(this.options.projectRoot, mapBuffer);
       }
     }
 
@@ -264,7 +262,20 @@ export default class UncommittedAsset {
   }
 
   setMap(map: ?SourceMap): void {
-    this.mapBuffer = map?.toBuffer();
+    // If we have sourceContent available, it means this asset is source code without
+    // a previous source map. Ensure that the map set by the transformer has the original
+    // source content available.
+    if (map != null && this.sourceContent != null) {
+      map.setSourceContent(
+        fromProjectPath(this.options.projectRoot, this.value.filePath),
+        // $FlowFixMe
+        this.sourceContent,
+      );
+      this.sourceContent = null;
+    }
+
+    this.map = map;
+    this.mapBuffer = this.map?.toBuffer();
   }
 
   getAST(): Promise<?AST> {
@@ -287,21 +298,22 @@ export default class UncommittedAsset {
   }
 
   getCacheKey(key: string): string {
-    return md5FromString(
-      PARCEL_VERSION + key + this.value.id + (this.value.hash || ''),
-    );
+    return hashString(PARCEL_VERSION + key + this.value.id);
   }
 
   addDependency(opts: DependencyOptions): string {
     // eslint-disable-next-line no-unused-vars
-    let {env, target, symbols, ...rest} = opts;
-    let dep = createDependency({
+    let {env, symbols, ...rest} = opts;
+    let dep = createDependency(this.options.projectRoot, {
       ...rest,
       // $FlowFixMe "convert" the $ReadOnlyMaps to the interal mutable one
       symbols,
-      env: mergeEnvironments(this.value.env, env),
+      env: mergeEnvironments(this.options.projectRoot, this.value.env, env),
       sourceAssetId: this.value.id,
-      sourcePath: this.value.filePath,
+      sourcePath: fromProjectPath(
+        this.options.projectRoot,
+        this.value.filePath,
+      ),
     });
     let existing = this.value.dependencies.get(dep.id);
     if (existing) {
@@ -312,26 +324,26 @@ export default class UncommittedAsset {
     return dep.id;
   }
 
-  addIncludedFile(filePath: FilePath) {
-    let invalidation: RequestInvalidation = {
-      type: 'file',
-      filePath,
-    };
+  invalidateOnFileChange(filePath: ProjectPath) {
+    this.invalidations.invalidateOnFileChange.add(filePath);
+  }
 
-    this.invalidations.set(getInvalidationId(invalidation), invalidation);
+  invalidateOnFileCreate(invalidation: FileCreateInvalidation) {
+    this.invalidations.invalidateOnFileCreate.push(
+      invalidateOnFileCreateToInternal(this.options.projectRoot, invalidation),
+    );
   }
 
   invalidateOnEnvChange(key: string) {
-    let invalidation: RequestInvalidation = {
-      type: 'env',
-      key,
-    };
-
-    this.invalidations.set(getInvalidationId(invalidation), invalidation);
+    this.invalidations.invalidateOnEnvChange.add(key);
   }
 
-  getInvalidations(): Array<RequestInvalidation> {
-    return [...this.invalidations.values()];
+  invalidateOnBuild() {
+    this.invalidations.invalidateOnBuild = true;
+  }
+
+  invalidateOnStartup() {
+    this.invalidations.invalidateOnStartup = true;
   }
 
   getDependencies(): Array<Dependency> {
@@ -341,23 +353,29 @@ export default class UncommittedAsset {
   createChildAsset(
     result: TransformerResult,
     plugin: PackageName,
-    configPath: FilePath,
-    configKeyPath: string,
+    configPath: ProjectPath,
+    configKeyPath?: string,
   ): UncommittedAsset {
     let content = result.content ?? null;
 
     let asset = new UncommittedAsset({
-      value: createAsset({
+      value: createAsset(this.options.projectRoot, {
         idBase: this.idBase,
-        hash: this.value.hash,
         filePath: this.value.filePath,
         type: result.type,
-        query: result.query,
-        isIsolated: result.isIsolated ?? this.value.isIsolated,
-        isInline: result.isInline ?? this.value.isInline,
-        isSplittable: result.isSplittable ?? this.value.isSplittable,
-        isSource: result.isSource ?? this.value.isSource,
-        env: mergeEnvironments(this.value.env, result.env),
+        bundleBehavior:
+          result.bundleBehavior ??
+          (this.value.bundleBehavior == null
+            ? null
+            : BundleBehaviorNames[this.value.bundleBehavior]),
+        isBundleSplittable:
+          result.isBundleSplittable ?? this.value.isBundleSplittable,
+        isSource: this.value.isSource,
+        env: mergeEnvironments(
+          this.options.projectRoot,
+          this.value.env,
+          result.env,
+        ),
         dependencies:
           this.value.type === result.type
             ? new Map(this.value.dependencies)
@@ -403,26 +421,8 @@ export default class UncommittedAsset {
     return asset;
   }
 
-  async getConfig(
-    filePaths: Array<FilePath>,
-    options: ?{|
-      packageKey?: string,
-      parse?: boolean,
-    |},
-  ): Promise<ConfigResult | null> {
-    let conf = await getConfig(this, filePaths, options);
-    if (conf == null) {
-      return null;
-    }
-
-    for (let file of conf.files) {
-      this.addIncludedFile(file.filePath);
-    }
-
-    return conf.config;
-  }
-
-  getPackage(): Promise<PackageJSON | null> {
-    return this.getConfig(['package.json']);
+  updateId() {
+    // $FlowFixMe - this is fine
+    this.value.id = createAssetIdFromOptions(this.value);
   }
 }

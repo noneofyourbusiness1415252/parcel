@@ -4,16 +4,36 @@ import SourceMap from '@parcel/source-map';
 import {Optimizer} from '@parcel/plugin';
 import postcss from 'postcss';
 import cssnano from 'cssnano';
+import type {CSSNanoOptions} from 'cssnano'; // TODO the type is based on cssnano 4
 
 export default (new Optimizer({
+  async loadConfig({config}) {
+    const configFile = await config.getConfig(
+      [
+        '.cssnanorc',
+        'cssnano.config.json',
+        'cssnano.config.js',
+        'cssnano.config.cjs',
+        'cssnano.config.mjs',
+      ],
+      {
+        packageKey: 'cssnano',
+      },
+    );
+    if (configFile) {
+      return configFile.contents;
+    }
+  },
+
   async optimize({
     bundle,
     contents: prevContents,
     getSourceMapReference,
     map: prevMap,
+    config,
     options,
   }) {
-    if (!bundle.env.minify) {
+    if (!bundle.env.shouldOptimize) {
       return {contents: prevContents, map: prevMap};
     }
 
@@ -23,7 +43,9 @@ export default (new Optimizer({
       );
     }
 
-    const result = await postcss([cssnano]).process(prevContents, {
+    const result = await postcss([
+      cssnano((config ?? {}: CSSNanoOptions)),
+    ]).process(prevContents, {
       // Suppress postcss's warning about a missing `from` property. In this
       // case, the input map contains all of the sources.
       from: undefined,
@@ -37,7 +59,7 @@ export default (new Optimizer({
     let map;
     if (result.map != null) {
       map = new SourceMap(options.projectRoot);
-      map.addRawMappings(result.map.toJSON());
+      map.addVLQMap(result.map.toJSON());
     }
 
     let contents = result.css;

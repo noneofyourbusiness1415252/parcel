@@ -1,140 +1,128 @@
 // @flow
 import {Transformer} from '@parcel/plugin';
-import {promisify} from '@parcel/utils';
 import path from 'path';
-import {EOL} from 'os';
-import SourceMap from '@parcel/source-map';
-
-// E.g: ~library/file.sass
-const WEBPACK_ALIAS_RE = /^~[^/]/;
+import sass from 'sass';
+import {transformLegacy} from './legacy';
+import {transformModern} from './modern';
 
 export default (new Transformer({
   async loadConfig({config, options}) {
-    let configFile = await config.getConfig(['.sassrc', '.sassrc.js'], {
-      packageKey: 'sass',
-    });
-
-    let configResult = {
-      contents: configFile ? configFile.contents : {},
-      isSerialisable: true,
-    };
-
-    if (configFile && path.extname(configFile.filePath) === '.js') {
-      config.shouldInvalidateOnStartup();
-      config.shouldReload();
-
-      configResult.isSerialisable = false;
-    }
-
-    if (configResult.contents.importer === undefined) {
-      configResult.contents.importer = [];
-    } else if (!Array.isArray(configResult.contents.importer)) {
-      configResult.contents.importer = [configResult.contents.importer];
-    }
-
-    // Always emit sourcemap
-    configResult.contents.sourceMap = true;
-    // sources are created relative to the directory of outFile
-    configResult.contents.outFile = path.join(
-      options.projectRoot,
-      'style.css.map',
+    let configFile = await config.getConfig(
+      ['.sassrc', '.sassrc.json', '.sassrc.js', '.sassrc.cjs', '.sassrc.mjs'],
+      {
+        packageKey: 'sass',
+      },
     );
-    configResult.contents.omitSourceMapUrl = true;
-    configResult.contents.sourceMapContents = false;
 
-    config.setResult(configResult);
-  },
+    let configResult = configFile ? configFile.contents : {};
 
-  preSerializeConfig({config}) {
-    if (!config.result) return;
-
-    // Ensure we dont try to serialise functions
-    if (!config.result.isSerialisable) {
-      config.result.contents = {};
-    }
-  },
-
-  async transform({asset, options, config, resolve}) {
-    let rawConfig = config ? config.contents : {};
-    let sass = await options.packageManager.require('sass', asset.filePath, {
-      shouldAutoInstall: options.shouldAutoInstall,
-    });
-
-    const sassRender = promisify(sass.render.bind(sass));
-    let css;
-    try {
-      let code = await asset.getCode();
-      let result = await sassRender({
-        ...rawConfig,
-        file: asset.filePath,
-        data: rawConfig.data ? rawConfig.data + EOL + code : code,
-        importer: [...rawConfig.importer, resolvePathImporter({resolve})],
-        indentedSyntax:
-          typeof rawConfig.indentedSyntax === 'boolean'
-            ? rawConfig.indentedSyntax
-            : asset.type === 'sass',
-      });
-
-      css = result.css;
-      for (let included of result.stats.includedFiles) {
-        if (included !== asset.filePath) {
-          asset.addIncludedFile(included);
-        }
-      }
-
-      if (result.map != null) {
-        let map = new SourceMap(options.projectRoot);
-        map.addRawMappings(JSON.parse(result.map));
-        asset.setMap(map);
-      }
-    } catch (err) {
-      // Adapt the Error object for the reporter.
-      err.fileName = err.file;
-      err.loc = {
-        line: err.line,
-        column: err.column,
-      };
-
-      throw err;
+    // Some packages in the wild declare a field `sass` in the package.json that
+    // is a relative path to the sass entrypoint. In those cases we simply
+    // initialize the config to an empty object.
+    if (typeof configResult === 'string') {
+      configResult = {};
     }
 
-    asset.type = 'css';
-    asset.setCode(css);
+    let version = detectVersion(configResult);
+
+    if (version === 'legacy') {
+      // Resolve relative paths from config file
+      if (configFile && configResult.includePaths) {
+        configResult.includePaths = configResult.includePaths.map(p =>
+          path.resolve(path.dirname(configFile.filePath), p),
+        );
+      }
+
+      if (configResult.importer === undefined) {
+        configResult.importer = [];
+      } else if (!Array.isArray(configResult.importer)) {
+        configResult.importer = [configResult.importer];
+      }
+
+      // Always emit sourcemap
+      configResult.sourceMap = true;
+      // sources are created relative to the directory of outFile
+      configResult.outFile = path.join(options.projectRoot, 'style.css.map');
+      configResult.omitSourceMapUrl = true;
+      configResult.sourceMapContents = false;
+    } else if (version === 'modern') {
+      // Resolve relative paths from config file
+      if (configFile && configResult.loadPaths) {
+        configResult.loadPaths = configResult.loadPaths.map(p =>
+          path.resolve(path.dirname(configFile.filePath), p),
+        );
+      }
+
+      // Always emit sourcemap
+      configResult.sourceMap = true;
+    }
+
+    return {version, config: configResult};
+  },
+
+  async transform({asset, options, config: {version, config}, resolve}) {
+    if (version === 'legacy') {
+      await transformLegacy(asset, config, resolve, options);
+    } else {
+      await transformModern(asset, config, resolve, options);
+    }
+
     return [asset];
   },
 }): Transformer);
 
-function resolvePathImporter({resolve}) {
-  return function(rawUrl, prev, done) {
-    let url = rawUrl.replace(/^file:\/\//, '');
+function detectVersion(config: any) {
+  if (!sass.compileStringAsync) {
+    return 'legacy';
+  }
 
-    if (WEBPACK_ALIAS_RE.test(url)) {
-      const correctPath = url.replace(/^~/, '');
-      const error = new Error(
-        `The @import path "${url}" is using webpack specific syntax, which isn't supported by Parcel.\n\nTo @import files from node_modules, use "${correctPath}"`,
-      );
-      done(error);
-      return;
+  for (let legacyOption of [
+    'data',
+    'indentType',
+    'indentWidth',
+    'linefeed',
+    'outputStyle',
+    'importer',
+    'pkgImporter',
+    'includePaths',
+    'omitSourceMapUrl',
+    'outFile',
+    'sourceMapContents',
+    'sourceMapEmbed',
+    'sourceMapRoot',
+  ]) {
+    if (config[legacyOption] != null) {
+      return 'legacy';
     }
+  }
 
-    resolve(prev, url)
-      .then(resolvedPath => {
-        done({file: resolvedPath});
-      })
-      .catch(() => {
-        /*
-         We return `null` instead of an error so that Sass' resolution algorithm can continue.
+  for (let modernOption of [
+    'loadPaths',
+    'sourceMapIncludeSources',
+    'style',
+    'importers',
+  ]) {
+    if (config[modernOption] != null) {
+      return 'modern';
+    }
+  }
 
-         Imports are resolved by trying, in order:
-           * Loading a file relative to the file in which the `@import` appeared.
-           * Each custom importer.
-           * Loading a file relative to the current working directory.
-           * Each load path in `includePaths`
-           * Each load path specified in the `SASS_PATH` environment variable, which should be semicolon-separated on Windows and colon-separated elsewhere.
+  if (typeof config.sourceMap === 'string') {
+    return 'legacy';
+  }
 
-         See: https://sass-lang.com/documentation/js-api#importer
-        */
-        done(null);
-      });
-  };
+  if (
+    config.functions &&
+    typeof config.functions === 'object' &&
+    Object.keys(config.functions).length > 0
+  ) {
+    for (let key in config.functions) {
+      let fn = config.functions[key];
+      if (typeof fn === 'function' && fn.length > 1) {
+        return 'legacy';
+      }
+    }
+  }
+
+  return 'modern';
 }

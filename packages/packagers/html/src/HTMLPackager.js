@@ -4,13 +4,13 @@ import type {Bundle, BundleGraph, NamedBundle} from '@parcel/types';
 import assert from 'assert';
 import {Readable} from 'stream';
 import {Packager} from '@parcel/plugin';
-import {setDifference} from '@parcel/utils';
 import posthtml from 'posthtml';
 import {
   bufferStream,
   replaceInlineReferences,
   replaceURLReferences,
   urlJoin,
+  getImportMap,
 } from '@parcel/utils';
 import nullthrows from 'nullthrows';
 
@@ -27,7 +27,26 @@ const metadataContent = new Set([
 ]);
 
 export default (new Packager({
-  async package({bundle, bundleGraph, getInlineBundleContents}) {
+  async loadConfig({config}) {
+    let posthtmlConfig = await config.getConfig(
+      [
+        '.posthtmlrc',
+        '.posthtmlrc.js',
+        '.posthtmlrc.cjs',
+        '.posthtmlrc.mjs',
+        'posthtml.config.js',
+        'posthtml.config.cjs',
+        'posthtml.config.mjs',
+      ],
+      {
+        packageKey: 'posthtml',
+      },
+    );
+    return {
+      render: posthtmlConfig?.contents?.render,
+    };
+  },
+  async package({bundle, bundleGraph, getInlineBundleContents, config}) {
     let assets = [];
     bundle.traverseAssets(asset => {
       assets.push(asset);
@@ -38,36 +57,26 @@ export default (new Packager({
     let asset = assets[0];
     let code = await asset.getCode();
 
-    // Add bundles in the same bundle group that are not inline. For example, if two inline
-    // bundles refer to the same library that is extracted into a shared bundle.
-    let referencedBundles = [
-      ...setDifference(
-        new Set(bundleGraph.getReferencedBundles(bundle)),
-        new Set(bundleGraph.getReferencedBundles(bundle, {recursive: false})),
-      ),
-    ].filter(b => !b.isInline);
-    let posthtmlConfig = await asset.getConfig(
-      ['.posthtmlrc', '.posthtmlrc.js', 'posthtml.config.js'],
-      {
-        packageKey: 'posthtml',
-      },
-    );
-    let renderConfig = posthtmlConfig?.render;
+    let renderConfig = config?.render;
 
     let {html} = await posthtml([
-      insertBundleReferences.bind(this, referencedBundles),
-      replaceInlineAssetContent.bind(
-        this,
-        bundleGraph,
-        getInlineBundleContents,
-      ),
-    ]).process(code, renderConfig);
+      // Add bundles in the same bundle group that are not inline. For example, if two inline
+      // bundles refer to the same library that is extracted into a shared bundle.
+      tree => insertBundleReferences(bundleGraph, bundle, tree),
+      tree =>
+        replaceInlineAssetContent(bundleGraph, getInlineBundleContents, tree),
+    ]).process(code, {
+      ...renderConfig,
+      xmlMode: bundle.type === 'xhtml',
+      closingSingleTag: bundle.type === 'xhtml' ? 'slash' : undefined,
+    });
 
     let {contents, map} = replaceURLReferences({
       bundle,
       bundleGraph,
       contents: html,
       relative: false,
+      getReplacement: contents => contents.replace(/"/g, '&quot;'),
     });
 
     return replaceInlineReferences({
@@ -77,7 +86,7 @@ export default (new Packager({
       getInlineBundleContents,
       getInlineReplacement: (dep, inlineType, contents) => ({
         from: dep.id,
-        to: contents,
+        to: contents.replace(/"/g, '&quot;').trim(),
       }),
       map,
     });
@@ -132,13 +141,30 @@ async function replaceInlineAssetContent(
 
     if (newContent != null) {
       let {contents, bundle} = newContent;
-      node.content = (contents instanceof Readable
-        ? await bufferStream(contents)
-        : contents
+      node.content = (
+        contents instanceof Readable ? await bufferStream(contents) : contents
       ).toString();
 
-      if (bundle.env.outputFormat === 'esmodule') {
+      if (
+        node.tag === 'script' &&
+        nullthrows(bundle).env.outputFormat === 'esmodule'
+      ) {
         node.attrs.type = 'module';
+      }
+
+      // Escape closing script tags and HTML comments in JS content.
+      // https://www.w3.org/TR/html52/semantics-scripting.html#restrictions-for-contents-of-script-elements
+      // Avoid replacing </script with <\/script as it would break the following valid JS: 0</script/ (i.e. regexp literal).
+      // Instead, escape the s character.
+      if (node.tag === 'script') {
+        node.content = node.content
+          .replace(/<!--/g, '<\\!--')
+          .replace(/<\/(script)/gi, '</\\$1');
+      }
+
+      // Escape closing style tags in CSS content.
+      if (node.tag === 'style') {
+        node.content = node.content.replace(/<\/(style)/gi, '<\\/$1');
       }
 
       // remove attr from output
@@ -149,33 +175,70 @@ async function replaceInlineAssetContent(
   return tree;
 }
 
-function insertBundleReferences(siblingBundles, tree) {
-  const bundles = [];
+function insertBundleReferences(bundleGraph, htmlBundle, tree) {
+  let bundles = [];
+  let importMap = {};
 
-  for (let bundle of siblingBundles) {
-    if (bundle.type === 'css') {
+  let useImportMap = htmlBundle.env.supports('import-meta-resolve');
+  let referencedBundles = new Set(bundleGraph.getReferencedBundles(htmlBundle));
+  let nonRecursiveReferencedBundles = new Set(
+    bundleGraph.getReferencedBundles(htmlBundle, {recursive: false}),
+  );
+
+  for (let bundle of referencedBundles) {
+    let isDirectlyReferenced = nonRecursiveReferencedBundles.has(bundle);
+    if (bundle.type === 'css' && !isDirectlyReferenced) {
       bundles.push({
         tag: 'link',
         attrs: {
           rel: 'stylesheet',
-          href: urlJoin(
-            nullthrows(bundle.target).publicUrl,
-            nullthrows(bundle.name),
-          ),
+          href: urlJoin(bundle.target.publicUrl, bundle.name),
         },
       });
-    } else if (bundle.type === 'js') {
+    } else if (bundle.type === 'js' && !isDirectlyReferenced) {
+      let nomodule =
+        bundle.env.outputFormat !== 'esmodule' &&
+        bundle.env.sourceType === 'module' &&
+        bundle.env.shouldScopeHoist;
       bundles.push({
         tag: 'script',
         attrs: {
           type: bundle.env.outputFormat === 'esmodule' ? 'module' : undefined,
-          src: urlJoin(
-            nullthrows(bundle.target).publicUrl,
-            nullthrows(bundle.name),
-          ),
+          nomodule: nomodule ? '' : undefined,
+          defer: nomodule ? '' : undefined,
+          src: urlJoin(bundle.target.publicUrl, bundle.name),
         },
       });
     }
+
+    if (useImportMap && bundle.type === 'js') {
+      Object.assign(importMap, getImportMap(bundleGraph, bundle));
+    }
+  }
+
+  if (useImportMap && Object.keys(importMap).length > 0) {
+    for (let id in importMap) {
+      importMap[id] = urlJoin(htmlBundle.target.publicUrl, importMap[id]);
+    }
+
+    // If there is an existing <script type="importmap">, merge with that.
+    // This will remove the existing node so it is moved before all other scripts.
+    let existingImportMap = findImportMap(tree);
+
+    if (existingImportMap) {
+      if (!existingImportMap.imports) {
+        existingImportMap.imports = {};
+      }
+      importMap = Object.assign(existingImportMap.imports, importMap);
+    }
+
+    bundles.unshift({
+      tag: 'script',
+      attrs: {
+        type: 'importmap',
+      },
+      content: JSON.stringify({imports: importMap}),
+    });
   }
 
   addBundlesToTree(bundles, tree);
@@ -187,6 +250,30 @@ function addBundlesToTree(bundles, tree) {
   const index = findBundleInsertIndex(content);
 
   content.splice(index, 0, ...bundles);
+}
+
+function findImportMap(tree) {
+  if (Array.isArray(tree)) {
+    for (let i = 0; i < tree.length; i++) {
+      let node = tree[i];
+      if (
+        node.tag === 'script' &&
+        node.attrs?.type === 'importmap' &&
+        Array.isArray(node.content)
+      ) {
+        let importMap = JSON.parse(node.content.join(''));
+        tree.splice(i, 1);
+        return importMap;
+      } else {
+        let res = findImportMap(node);
+        if (res) {
+          return res;
+        }
+      }
+    }
+  } else if (tree && typeof tree.content === 'object') {
+    return findImportMap(tree.content);
+  }
 }
 
 function find(tree, tag) {

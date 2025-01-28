@@ -1,24 +1,21 @@
 // @flow strict-local
 
-import typeof TypeScriptModule from 'typescript'; // eslint-disable-line import/no-extraneous-dependencies
 import type {TranspileOptions} from 'typescript';
 
 import {Transformer} from '@parcel/plugin';
 import {loadTSConfig} from '@parcel/ts-utils';
+import typescript from 'typescript';
+import SourceMap from '@parcel/source-map';
 
 export default (new Transformer({
-  async loadConfig({config, options}) {
-    await loadTSConfig(config, options);
+  loadConfig({config, options}) {
+    return loadTSConfig(config, options);
   },
 
   async transform({asset, config, options}) {
-    asset.type = 'js';
-
-    let [typescript, code]: [TypeScriptModule, string] = await Promise.all([
-      options.packageManager.require('typescript', asset.filePath, {
-        shouldAutoInstall: options.shouldAutoInstall,
-      }),
+    let [code, originalMap] = await Promise.all([
       asset.getCode(),
+      asset.getMap(),
     ]);
 
     let transpiled = typescript.transpileModule(
@@ -34,16 +31,32 @@ export default (new Transformer({
           // Don't compile ES `import`s -- scope hoisting prefers them and they will
           // otherwise compiled to CJS via babel in the js transformer
           module: typescript.ModuleKind.ESNext,
+          sourceMap: Boolean(asset.env.sourceMap),
+          mapRoot: options.projectRoot,
         },
         fileName: asset.filePath, // Should be relativePath?
       }: TranspileOptions),
     );
 
-    return [
-      {
-        type: 'js',
-        content: transpiled.outputText,
-      },
-    ];
+    let {outputText, sourceMapText} = transpiled;
+
+    if (sourceMapText != null) {
+      outputText = outputText.substring(
+        0,
+        outputText.lastIndexOf('//# sourceMappingURL'),
+      );
+
+      let map = new SourceMap(options.projectRoot);
+      map.addVLQMap(JSON.parse(sourceMapText));
+      if (originalMap) {
+        map.extends(originalMap);
+      }
+      asset.setMap(map);
+    }
+
+    asset.type = 'js';
+    asset.setCode(outputText);
+
+    return [asset];
   },
 }): Transformer);

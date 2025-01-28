@@ -1,6 +1,10 @@
 // @flow strict-local
 
-import type {IDisposable, LogEvent} from '@parcel/types';
+import type {
+  IDisposable,
+  LogEvent,
+  PluginLogger as IPluginLogger,
+} from '@parcel/types';
 import type {
   Diagnostic,
   Diagnostifiable,
@@ -83,7 +87,7 @@ export type PluginLoggerOpts = {|
   origin: string,
 |};
 
-export class PluginLogger {
+export class PluginLogger implements IPluginLogger {
   /** @private */
   origin: string;
 
@@ -98,9 +102,9 @@ export class PluginLogger {
   ): Diagnostic | Array<Diagnostic> {
     return Array.isArray(diagnostic)
       ? diagnostic.map(d => {
-          return {...d, origin: this.origin};
+          return {...d, origin: d.origin ?? this.origin};
         })
-      : {...diagnostic, origin: this.origin};
+      : {...diagnostic, origin: diagnostic.origin ?? this.origin};
   }
 
   verbose(

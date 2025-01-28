@@ -1,8 +1,14 @@
 // @flow strict-local
 
-import type {Bundle, ParcelOptions, ProcessedParcelConfig} from './types';
+import type {
+  Bundle,
+  ParcelOptions,
+  ProcessedParcelConfig,
+  RequestInvalidation,
+} from './types';
 import type {SharedReference, WorkerApi} from '@parcel/workers';
 import {loadConfig as configCache} from '@parcel/utils';
+import type {DevDepSpecifier} from './requests/DevDepRequest';
 
 import invariant from 'assert';
 import nullthrows from 'nullthrows';
@@ -11,15 +17,29 @@ import Transformation, {
   type TransformationOpts,
   type TransformationResult,
 } from './Transformation';
-import {reportWorker} from './ReporterRunner';
-import PackagerRunner, {type BundleInfo} from './PackagerRunner';
+import {reportWorker, report} from './ReporterRunner';
+import PackagerRunner, {type RunPackagerRunnerResult} from './PackagerRunner';
 import Validation, {type ValidationOpts} from './Validation';
 import ParcelConfig from './ParcelConfig';
-import {registerCoreWithSerializer} from './utils';
+import {registerCoreWithSerializer} from './registerCoreWithSerializer';
+import {clearBuildCaches} from './buildCache';
+import {init as initSourcemaps} from '@parcel/source-map';
+import {init as initRust} from '@parcel/rust';
+import WorkerFarm from '@parcel/workers';
+import {setFeatureFlags} from '@parcel/feature-flags';
 
 import '@parcel/cache'; // register with serializer
 import '@parcel/package-manager';
 import '@parcel/fs';
+
+// $FlowFixMe
+if (process.env.PARCEL_BUILD_REPL && process.browser) {
+  /* eslint-disable import/no-extraneous-dependencies, monorepo/no-internal-import */
+  require('@parcel/repl/src/parcel/BrowserPackageManager.js');
+  // $FlowFixMe
+  require('@parcel/repl/src/parcel/ExtendedMemoryFS.js');
+  /* eslint-enable import/no-extraneous-dependencies, monorepo/no-internal-import */
+}
 
 registerCoreWithSerializer();
 
@@ -50,24 +70,24 @@ function loadOptions(ref, workerApi) {
 
 async function loadConfig(cachePath, options) {
   let config = parcelConfigCache.get(cachePath);
-  if (config) {
+  if (config && config.options === options) {
     return config;
   }
 
-  let processedConfig = nullthrows(await options.cache.get(cachePath));
-  config = new ParcelConfig(
-    // $FlowFixMe
-    ((processedConfig: any): ProcessedParcelConfig),
-    options.packageManager,
-    options.inputFS,
-    options.shouldAutoInstall,
+  let processedConfig = nullthrows(
+    await options.cache.get<ProcessedParcelConfig>(cachePath),
   );
+  config = new ParcelConfig(processedConfig, options);
   parcelConfigCache.set(cachePath, config);
+
+  setFeatureFlags(options.featureFlags);
+
   return config;
 }
 
 export function clearConfigCache() {
   configCache.clear();
+  clearBuildCaches();
 }
 
 export async function runTransform(
@@ -80,7 +100,6 @@ export async function runTransform(
 
   return new Transformation({
     workerApi,
-    report: reportWorker.bind(null, workerApi),
     options,
     config,
     ...rest,
@@ -109,57 +128,44 @@ export async function runPackage(
   {
     bundle,
     bundleGraphReference,
-    configRef,
+    configCachePath,
     optionsRef,
+    previousDevDeps,
+    invalidDevDeps,
+    previousInvalidations,
   }: {|
     bundle: Bundle,
     bundleGraphReference: SharedReference,
-    configRef: SharedReference,
-    cacheKeys: {|
-      content: string,
-      map: string,
-      info: string,
-    |},
+    configCachePath: string,
     optionsRef: SharedReference,
+    previousDevDeps: Map<string, string>,
+    invalidDevDeps: Array<DevDepSpecifier>,
+    previousInvalidations: Array<RequestInvalidation>,
   |},
-): Promise<BundleInfo> {
+): Promise<RunPackagerRunnerResult> {
   let bundleGraph = workerApi.getSharedReference(bundleGraphReference);
   invariant(bundleGraph instanceof BundleGraph);
   let options = loadOptions(optionsRef, workerApi);
-  let processedConfig = ((workerApi.getSharedReference(
-    configRef,
-    // $FlowFixMe
-  ): any): ProcessedParcelConfig);
-  let parcelConfig = new ParcelConfig(
-    processedConfig,
-    options.packageManager,
-    options.inputFS,
-    options.shouldAutoInstall,
-  );
+  let parcelConfig = await loadConfig(configCachePath, options);
 
   let runner = new PackagerRunner({
     config: parcelConfig,
     options,
-    report: reportWorker.bind(null, workerApi),
+    report: WorkerFarm.isWorker() ? reportWorker.bind(null, workerApi) : report,
+    previousDevDeps,
+    previousInvalidations,
   });
 
-  let configs = await runner.loadConfigs(bundleGraph, bundle);
-  // TODO: add invalidations in `config?.files` once packaging is a request
-
-  let cacheKey = await runner.getCacheKey(bundle, bundleGraph, configs);
-  let cacheKeys = {
-    content: PackagerRunner.getContentKey(cacheKey),
-    map: PackagerRunner.getMapKey(cacheKey),
-    info: PackagerRunner.getInfoKey(cacheKey),
-  };
-
-  return (
-    (await runner.getBundleInfoFromCache(cacheKeys.info)) ??
-    runner.getBundleInfo(bundle, bundleGraph, cacheKeys, configs)
-  );
+  return runner.run(bundleGraph, bundle, invalidDevDeps);
 }
 
-const PKG_RE = /node_modules[/\\]((?:@[^/\\]+\/[^/\\]+)|[^/\\]+)(?!.*[/\\]node_modules[/\\])/;
+export async function childInit() {
+  await initSourcemaps;
+  await initRust?.();
+}
+
+const PKG_RE =
+  /node_modules[/\\]((?:@[^/\\]+[/\\][^/\\]+)|[^/\\]+)(?!.*[/\\]node_modules[/\\])/;
 export function invalidateRequireCache(workerApi: WorkerApi, file: string) {
   if (process.env.PARCEL_BUILD_ENV === 'test') {
     // Delete this module and all children in the same node_modules folder
@@ -174,6 +180,8 @@ export function invalidateRequireCache(workerApi: WorkerApi, file: string) {
         }
       }
     }
+
+    parcelConfigCache.clear();
     return;
   }
 

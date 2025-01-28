@@ -6,32 +6,39 @@ import type {
   RawParcelConfig,
   ResolvedParcelConfigFile,
 } from '@parcel/types';
+import type {FileSystem} from '@parcel/fs';
 import type {StaticRunOpts} from '../RequestTracker';
 import type {
   ExtendableParcelConfigPipeline,
+  PureParcelConfigPipeline,
   ParcelOptions,
   ProcessedParcelConfig,
 } from '../types';
 
 import {
   isDirectoryInside,
-  md5FromObject,
+  hashObject,
   resolveConfig,
-  resolve,
   validateSchema,
   findAlternativeNodeModules,
   findAlternativeFiles,
 } from '@parcel/utils';
 import ThrowableDiagnostic, {
   generateJSONCodeHighlights,
+  escapeMarkdown,
+  md,
+  errorToDiagnostic,
 } from '@parcel/diagnostic';
 import {parse} from 'json5';
 import path from 'path';
-import assert from 'assert';
+import invariant from 'assert';
 
 import ParcelConfigSchema from '../ParcelConfig.schema';
 import {optionsProxy} from '../utils';
 import ParcelConfig from '../ParcelConfig';
+import {createBuildCache} from '../buildCache';
+import {toProjectPath} from '../projectPath';
+import {requestTypes} from '../RequestTracker';
 
 type ConfigMap<K, V> = {[K]: V, ...};
 
@@ -40,17 +47,19 @@ export type ConfigAndCachePath = {|
   cachePath: string,
 |};
 
-type RunOpts = {|
+type RunOpts<TResult> = {|
   input: null,
-  ...StaticRunOpts<ConfigAndCachePath>,
+  ...StaticRunOpts<TResult>,
 |};
 
 export type ParcelConfigRequest = {|
   id: string,
-  type: string,
+  type: typeof requestTypes.parcel_config_request,
   input: null,
-  run: RunOpts => Async<ConfigAndCachePath>,
+  run: (RunOpts<ParcelConfigRequestResult>) => Async<ParcelConfigRequestResult>,
 |};
+
+export type ParcelConfigRequestResult = ConfigAndCachePath;
 
 type ParcelConfigChain = {|
   config: ProcessedParcelConfig,
@@ -62,9 +71,16 @@ const type = 'parcel_config_request';
 export default function createParcelConfigRequest(): ParcelConfigRequest {
   return {
     id: type,
-    type,
-    async run({api, options}: RunOpts): Promise<ConfigAndCachePath> {
-      let {config, extendedFiles, usedDefault} = await loadParcelConfig(
+    type: requestTypes[type],
+    async run({api, options}) {
+      let {
+        config,
+        extendedFiles,
+        usedDefault,
+      }: {|
+        ...ParcelConfigChain,
+        usedDefault: boolean,
+      |} = await loadParcelConfig(
         optionsProxy(options, api.invalidateOnOptionChange),
       );
 
@@ -72,15 +88,20 @@ export default function createParcelConfigRequest(): ParcelConfigRequest {
       api.invalidateOnFileDelete(config.filePath);
 
       for (let filePath of extendedFiles) {
-        api.invalidateOnFileUpdate(filePath);
-        api.invalidateOnFileDelete(filePath);
+        let pp = toProjectPath(options.projectRoot, filePath);
+        api.invalidateOnFileUpdate(pp);
+        api.invalidateOnFileDelete(pp);
       }
 
       if (usedDefault) {
-        api.invalidateOnFileCreate('**/.parcelrc');
+        let resolveFrom = getResolveFrom(options.inputFS, options.projectRoot);
+        api.invalidateOnFileCreate({
+          fileName: '.parcelrc',
+          aboveFilePath: toProjectPath(options.projectRoot, resolveFrom),
+        });
       }
 
-      let cachePath = md5FromObject(config);
+      let cachePath = hashObject(config);
       await options.cache.set(cachePath, config);
       let result = {config, cachePath};
       // TODO: don't store config twice (once in the graph and once in a separate cache entry)
@@ -91,8 +112,7 @@ export default function createParcelConfigRequest(): ParcelConfigRequest {
   };
 }
 
-const parcelConfigCache = new Map();
-
+const parcelConfigCache = createBuildCache();
 export function getCachedParcelConfig(
   result: ConfigAndCachePath,
   options: ParcelOptions,
@@ -103,12 +123,7 @@ export function getCachedParcelConfig(
     return config;
   }
 
-  config = new ParcelConfig(
-    processedConfig,
-    options.packageManager,
-    options.inputFS,
-    options.shouldAutoInstall,
-  );
+  config = new ParcelConfig(processedConfig, options);
 
   parcelConfigCache.set(cachePath, config);
   return config;
@@ -129,23 +144,23 @@ export async function loadParcelConfig(
 export async function resolveParcelConfig(
   options: ParcelOptions,
 ): Promise<?{|...ParcelConfigChain, usedDefault: boolean|}> {
-  let resolveFrom = getResolveFrom(options);
+  let resolveFrom = getResolveFrom(options.inputFS, options.projectRoot);
   let configPath =
     options.config != null
-      ? (
-          await resolve(options.inputFS, options.config, {
-            basedir: resolveFrom,
-          })
-        ).resolved
-      : await resolveConfig(options.inputFS, resolveFrom, ['.parcelrc']);
+      ? (await options.packageManager.resolve(options.config, resolveFrom))
+          .resolved
+      : await resolveConfig(
+          options.inputFS,
+          resolveFrom,
+          ['.parcelrc'],
+          options.projectRoot,
+        );
 
   let usedDefault = false;
   if (configPath == null && options.defaultConfig != null) {
     usedDefault = true;
     configPath = (
-      await resolve(options.inputFS, options.defaultConfig, {
-        basedir: resolveFrom,
-      })
+      await options.packageManager.resolve(options.defaultConfig, resolveFrom)
     ).resolved;
   }
 
@@ -159,7 +174,7 @@ export async function resolveParcelConfig(
   } catch (e) {
     throw new ThrowableDiagnostic({
       diagnostic: {
-        message: `Could not find parcel config at ${path.relative(
+        message: md`Could not find parcel config at ${path.relative(
           options.projectRoot,
           configPath,
         )}`,
@@ -168,11 +183,22 @@ export async function resolveParcelConfig(
     });
   }
 
-  let {config, extendedFiles} = await parseAndProcessConfig(
+  let {config, extendedFiles}: ParcelConfigChain = await parseAndProcessConfig(
     configPath,
     contents,
     options,
   );
+
+  if (options.additionalReporters.length > 0) {
+    config.reporters = [
+      ...options.additionalReporters.map(({packageName, resolveFrom}) => ({
+        packageName,
+        resolveFrom,
+      })),
+      ...(config.reporters ?? []),
+    ];
+  }
+
   return {config, extendedFiles, usedDefault};
 }
 
@@ -199,21 +225,23 @@ export async function parseAndProcessConfig(
     };
     throw new ThrowableDiagnostic({
       diagnostic: {
-        message: 'Failed to parse .parcelrc',
+        message: `Failed to parse .parcelrc`,
         origin: '@parcel/core',
 
-        filePath: configPath,
-        language: 'json5',
-        codeFrame: {
-          code: contents,
-          codeHighlights: [
-            {
-              start: pos,
-              end: pos,
-              message: e.message,
-            },
-          ],
-        },
+        codeFrames: [
+          {
+            filePath: configPath,
+            language: 'json5',
+            code: contents,
+            codeHighlights: [
+              {
+                start: pos,
+                end: pos,
+                message: escapeMarkdown(e.message),
+              },
+            ],
+          },
+        ],
       },
     });
   }
@@ -221,96 +249,168 @@ export async function parseAndProcessConfig(
 }
 
 function processPipeline(
+  options: ParcelOptions,
   pipeline: ?Array<PackageName>,
   keyPath: string,
   filePath: FilePath,
-  //$FlowFixMe
-): any {
+) {
   if (pipeline) {
     return pipeline.map((pkg, i) => {
+      // $FlowFixMe
       if (pkg === '...') return pkg;
 
       return {
         packageName: pkg,
-        resolveFrom: filePath,
+        resolveFrom: toProjectPath(options.projectRoot, filePath),
         keyPath: `${keyPath}/${i}`,
       };
     });
   }
 }
 
-function processMap(
+const RESERVED_PIPELINES = new Set([
+  'node:',
+  'npm:',
+  'http:',
+  'https:',
+  'data:',
+  'tel:',
+  'mailto:',
+]);
+
+async function processMap(
   // $FlowFixMe
   map: ?ConfigMap<any, any>,
   keyPath: string,
   filePath: FilePath,
+  options: ParcelOptions,
   // $FlowFixMe
-): ConfigMap<any, any> | typeof undefined {
+): Promise<ConfigMap<any, any> | typeof undefined> {
   if (!map) return undefined;
 
   // $FlowFixMe
   let res: ConfigMap<any, any> = {};
   for (let k in map) {
+    let i = k.indexOf(':');
+    if (i > 0 && RESERVED_PIPELINES.has(k.slice(0, i + 1))) {
+      let code = await options.inputFS.readFile(filePath, 'utf8');
+      throw new ThrowableDiagnostic({
+        diagnostic: {
+          message: `Named pipeline '${k.slice(0, i + 1)}' is reserved.`,
+          origin: '@parcel/core',
+          codeFrames: [
+            {
+              filePath: filePath,
+              language: 'json5',
+              code,
+              codeHighlights: generateJSONCodeHighlights(code, [
+                {
+                  key: `${keyPath}/${k}`,
+                  type: 'key',
+                },
+              ]),
+            },
+          ],
+          documentationURL:
+            'https://parceljs.org/features/dependency-resolution/#url-schemes',
+        },
+      });
+    }
+
     if (typeof map[k] === 'string') {
       res[k] = {
         packageName: map[k],
-        resolveFrom: filePath,
+        resolveFrom: toProjectPath(options.projectRoot, filePath),
         keyPath: `${keyPath}/${k}`,
       };
     } else {
-      res[k] = processPipeline(map[k], `${keyPath}/${k}`, filePath);
+      res[k] = processPipeline(options, map[k], `${keyPath}/${k}`, filePath);
     }
   }
 
   return res;
 }
 
-export function processConfig(
+export async function processConfig(
   configFile: ResolvedParcelConfigFile,
-): ProcessedParcelConfig {
+  options: ParcelOptions,
+): Promise<ProcessedParcelConfig> {
   return {
-    extends: configFile.extends,
-    filePath: configFile.filePath,
-    resolveFrom: configFile.resolveFrom,
+    filePath: toProjectPath(options.projectRoot, configFile.filePath),
+    ...(configFile.resolveFrom != null
+      ? {
+          resolveFrom: toProjectPath(
+            options.projectRoot,
+            configFile.resolveFrom,
+          ),
+        }
+      : {
+          /*::...null*/
+        }),
     resolvers: processPipeline(
+      options,
       configFile.resolvers,
       '/resolvers',
       configFile.filePath,
     ),
-    transformers: processMap(
+    transformers: await processMap(
       configFile.transformers,
       '/transformers',
       configFile.filePath,
+      options,
     ),
     bundler:
       configFile.bundler != null
         ? {
             packageName: configFile.bundler,
-            resolveFrom: configFile.filePath,
+            resolveFrom: toProjectPath(
+              options.projectRoot,
+              configFile.filePath,
+            ),
             keyPath: '/bundler',
           }
         : undefined,
-    namers: processPipeline(configFile.namers, '/namers', configFile.filePath),
-    runtimes: processMap(configFile.runtimes, '/runtimes', configFile.filePath),
-    packagers: processMap(
+    namers: processPipeline(
+      options,
+      configFile.namers,
+      '/namers',
+      configFile.filePath,
+    ),
+    runtimes: processPipeline(
+      options,
+      configFile.runtimes,
+      '/runtimes',
+      configFile.filePath,
+    ),
+    packagers: await processMap(
       configFile.packagers,
       '/packagers',
       configFile.filePath,
+      options,
     ),
-    optimizers: processMap(
+    optimizers: await processMap(
       configFile.optimizers,
       '/optimizers',
       configFile.filePath,
+      options,
+    ),
+    compressors: await processMap(
+      configFile.compressors,
+      '/compressors',
+      configFile.filePath,
+      options,
     ),
     reporters: processPipeline(
+      options,
       configFile.reporters,
       '/reporters',
       configFile.filePath,
     ),
-    validators: processMap(
+    validators: await processMap(
       configFile.validators,
       '/validators',
       configFile.filePath,
+      options,
     ),
   };
 }
@@ -325,10 +425,13 @@ export async function processConfigChain(
   validateConfigFile(configFile, relativePath);
 
   // Process config...
-  let config: ProcessedParcelConfig = processConfig({
-    filePath,
-    ...configFile,
-  });
+  let config: ProcessedParcelConfig = await processConfig(
+    {
+      filePath,
+      ...configFile,
+    },
+    options,
+  );
 
   let extendedFiles: Array<FilePath> = [];
   if (configFile.extends != null) {
@@ -346,16 +449,8 @@ export async function processConfigChain(
             : '/extends';
           let resolved = await resolveExtends(ext, filePath, key, options);
           extendedFiles.push(resolved);
-          let {
-            extendedFiles: moreExtendedFiles,
-            config: nextConfig,
-          } = await processExtendedConfig(
-            filePath,
-            key,
-            ext,
-            resolved,
-            options,
-          );
+          let {extendedFiles: moreExtendedFiles, config: nextConfig} =
+            await processExtendedConfig(filePath, key, ext, resolved, options);
           extendedFiles = extendedFiles.concat(moreExtendedFiles);
           extStartConfig = extStartConfig
             ? mergeConfigs(extStartConfig, nextConfig)
@@ -375,7 +470,7 @@ export async function processConfigChain(
 
     if (errors.length > 0) {
       throw new ThrowableDiagnostic({
-        diagnostic: errors.flatMap(e => e.diagnostics),
+        diagnostic: errors.flatMap(e => e.diagnostics ?? errorToDiagnostic(e)),
       });
     }
   }
@@ -393,10 +488,7 @@ export async function resolveExtends(
     return path.resolve(path.dirname(configPath), ext);
   } else {
     try {
-      let {resolved} = await resolve(options.inputFS, ext, {
-        basedir: path.dirname(configPath),
-        extensions: ['.json'],
-      });
+      let {resolved} = await options.packageManager.resolve(ext, configPath);
       return options.inputFS.realpath(resolved);
     } catch (err) {
       let parentContents = await options.inputFS.readFile(configPath, 'utf8');
@@ -407,22 +499,26 @@ export async function resolveExtends(
       );
       throw new ThrowableDiagnostic({
         diagnostic: {
-          message: 'Cannot find extended parcel config',
+          message: `Cannot find extended parcel config`,
           origin: '@parcel/core',
-          filePath: configPath,
-          language: 'json5',
-          codeFrame: {
-            code: parentContents,
-            codeHighlights: generateJSONCodeHighlights(parentContents, [
-              {
-                key: extendsKey,
-                type: 'value',
-                message: `Cannot find module "${ext}"${
-                  alternatives[0] ? `, did you mean "${alternatives[0]}"?` : ''
-                }`,
-              },
-            ]),
-          },
+          codeFrames: [
+            {
+              filePath: configPath,
+              language: 'json5',
+              code: parentContents,
+              codeHighlights: generateJSONCodeHighlights(parentContents, [
+                {
+                  key: extendsKey,
+                  type: 'value',
+                  message: md`Cannot find module "${ext}"${
+                    alternatives[0]
+                      ? `, did you mean "${alternatives[0]}"?`
+                      : ''
+                  }`,
+                },
+              ]),
+            },
+          ],
         },
       });
     }
@@ -448,25 +544,28 @@ async function processExtendedConfig(
       options.inputFS,
       extendsSpecifier,
       path.dirname(resolvedExtendedConfigPath),
+      options.projectRoot,
     );
     throw new ThrowableDiagnostic({
       diagnostic: {
         message: 'Cannot find extended parcel config',
         origin: '@parcel/core',
-        filePath: configPath,
-        language: 'json5',
-        codeFrame: {
-          code: parentContents,
-          codeHighlights: generateJSONCodeHighlights(parentContents, [
-            {
-              key: extendsKey,
-              type: 'value',
-              message: `"${extendsSpecifier}" does not exist${
-                alternatives[0] ? `, did you mean "./${alternatives[0]}"?` : ''
-              }`,
-            },
-          ]),
-        },
+        codeFrames: [
+          {
+            filePath: configPath,
+            language: 'json5',
+            code: parentContents,
+            codeHighlights: generateJSONCodeHighlights(parentContents, [
+              {
+                key: extendsKey,
+                type: 'value',
+                message: md`"${extendsSpecifier}" does not exist${
+                  alternatives[0] ? `, did you mean "${alternatives[0]}"?` : ''
+                }`,
+              },
+            ]),
+          },
+        ],
       },
     });
   }
@@ -478,7 +577,16 @@ export function validateConfigFile(
   config: RawParcelConfig | ResolvedParcelConfigFile,
   relativePath: FilePath,
 ) {
-  validateNotEmpty(config, relativePath);
+  try {
+    validateNotEmpty(config, relativePath);
+  } catch (e) {
+    throw new ThrowableDiagnostic({
+      diagnostic: {
+        message: e.message,
+        origin: '@parcel/core',
+      },
+    });
+  }
 
   validateSchema.diagnostic(
     ParcelConfigSchema,
@@ -492,7 +600,7 @@ export function validateNotEmpty(
   config: RawParcelConfig | ResolvedParcelConfigFile,
   relativePath: FilePath,
 ) {
-  assert.notDeepStrictEqual(config, {}, `${relativePath} can't be empty`);
+  invariant.notDeepStrictEqual(config, {}, `${relativePath} can't be empty`);
 }
 
 export function mergeConfigs(
@@ -501,7 +609,9 @@ export function mergeConfigs(
 ): ProcessedParcelConfig {
   return {
     filePath: ext.filePath,
-    resolvers: mergePipelines(base.resolvers, ext.resolvers),
+    resolvers: assertPurePipeline(
+      mergePipelines(base.resolvers, ext.resolvers),
+    ),
     transformers: mergeMaps(
       base.transformers,
       ext.transformers,
@@ -509,50 +619,60 @@ export function mergeConfigs(
     ),
     validators: mergeMaps(base.validators, ext.validators, mergePipelines),
     bundler: ext.bundler || base.bundler,
-    namers: mergePipelines(base.namers, ext.namers),
-    runtimes: mergeMaps(base.runtimes, ext.runtimes, mergePipelines),
+    namers: assertPurePipeline(mergePipelines(base.namers, ext.namers)),
+    runtimes: assertPurePipeline(mergePipelines(base.runtimes, ext.runtimes)),
     packagers: mergeMaps(base.packagers, ext.packagers),
     optimizers: mergeMaps(base.optimizers, ext.optimizers, mergePipelines),
-    reporters: mergePipelines(base.reporters, ext.reporters),
+    compressors: mergeMaps(base.compressors, ext.compressors, mergePipelines),
+    reporters: assertPurePipeline(
+      mergePipelines(base.reporters, ext.reporters),
+    ),
   };
 }
 
-function getResolveFrom(options: ParcelOptions) {
-  let cwd = options.inputFS.cwd();
-  let dir = isDirectoryInside(cwd, options.projectRoot)
-    ? cwd
-    : options.projectRoot;
+export function getResolveFrom(
+  fs: FileSystem,
+  projectRoot: FilePath,
+): FilePath {
+  let cwd = fs.cwd();
+  let dir = isDirectoryInside(cwd, projectRoot) ? cwd : projectRoot;
   return path.join(dir, 'index');
+}
+
+function assertPurePipeline(
+  pipeline: ExtendableParcelConfigPipeline,
+): PureParcelConfigPipeline {
+  return pipeline.map(s => {
+    invariant(typeof s !== 'string');
+    return s;
+  });
 }
 
 export function mergePipelines(
   base: ?ExtendableParcelConfigPipeline,
   ext: ?ExtendableParcelConfigPipeline,
-  // $FlowFixMe
-): any {
+): ExtendableParcelConfigPipeline {
   if (ext == null) {
     return base ?? [];
   }
 
-  if (base) {
-    // Merge the base pipeline if a rest element is defined
-    let spreadIndex = ext.indexOf('...');
-    if (spreadIndex >= 0) {
-      if (ext.filter(v => v === '...').length > 1) {
-        throw new Error(
-          'Only one spread element can be included in a config pipeline',
-        );
-      }
-
-      return [
-        ...ext.slice(0, spreadIndex),
-        ...(base || []),
-        ...ext.slice(spreadIndex + 1),
-      ];
-    }
+  if (ext.filter(v => v === '...').length > 1) {
+    throw new Error(
+      'Only one spread element can be included in a config pipeline',
+    );
   }
 
-  return ext;
+  // Merge the base pipeline if a rest element is defined
+  let spreadIndex = ext.indexOf('...');
+  if (spreadIndex >= 0) {
+    return [
+      ...ext.slice(0, spreadIndex),
+      ...(base ?? []),
+      ...ext.slice(spreadIndex + 1),
+    ];
+  } else {
+    return ext;
+  }
 }
 
 export function mergeMaps<K: string, V>(

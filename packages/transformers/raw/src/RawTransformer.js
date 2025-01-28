@@ -4,7 +4,8 @@ import {Transformer} from '@parcel/plugin';
 
 export default (new Transformer({
   transform({asset}) {
-    asset.isIsolated = true;
+    asset.bundleBehavior = 'isolated';
+    asset.meta.jsRuntime = 'url';
     return [asset];
   },
 }): Transformer);

@@ -1,9 +1,10 @@
 // @flow
 
-import type {FilePath} from '@parcel/types';
+import type {FilePath} from '@parcel/types-internal';
 import type {BackendType, WorkerImpl, WorkerMessage} from './types';
 import type {SharedReference} from './WorkerFarm';
 
+import nullthrows from 'nullthrows';
 import EventEmitter from 'events';
 import ThrowableDiagnostic from '@parcel/diagnostic';
 import {getWorkerBackend} from './backend';
@@ -22,6 +23,7 @@ type WorkerOpts = {|
   forcedKillTime: number,
   backend: BackendType,
   shouldPatchConsole?: boolean,
+  shouldTrace?: boolean,
   sharedReferences: $ReadOnlyMap<SharedReference, mixed>,
 |};
 
@@ -30,7 +32,7 @@ export default class Worker extends EventEmitter {
   +options: WorkerOpts;
   worker: WorkerImpl;
   id: number = WORKER_ID++;
-  sharedReferences: $ReadOnlyMap<SharedReference, mixed> = new Map();
+  sentSharedReferences: Set<SharedReference> = new Set();
 
   calls: Map<number, WorkerCall> = new Map();
   exitCode: ?number = null;
@@ -46,24 +48,43 @@ export default class Worker extends EventEmitter {
   }
 
   async fork(forkModule: FilePath) {
-    let filteredArgs = process.execArgv.filter(
-      v => !/^--(debug|inspect|max-old-space-size=)/.test(v),
-    );
+    let filteredArgs = [];
+    if (process.execArgv) {
+      filteredArgs = process.execArgv.filter(
+        v =>
+          !/^--(debug|inspect|no-opt|max-old-space-size=|max-semi-space-size=|expose-gc)/.test(
+            v,
+          ),
+      );
 
-    for (let i = 0; i < filteredArgs.length; i++) {
-      let arg = filteredArgs[i];
-      if (
-        (arg === '-r' || arg === '--require') &&
-        filteredArgs[i + 1] === '@parcel/register'
-      ) {
-        filteredArgs.splice(i, 2);
-        i--;
+      for (let i = 0; i < filteredArgs.length; i++) {
+        let arg = filteredArgs[i];
+        let isArgWithParam =
+          ((arg === '-r' || arg === '--require') &&
+            filteredArgs[i + 1] === '@parcel/register') ||
+          arg === '--title';
+        if (isArgWithParam) {
+          filteredArgs.splice(i, 2);
+          i--;
+        }
       }
     }
 
     // Workaround for https://github.com/nodejs/node/issues/29117
     if (process.env.NODE_OPTIONS) {
-      let opts = process.env.NODE_OPTIONS.split(' ');
+      // arg parsing logic adapted from https://stackoverflow.com/a/46946420/2352201
+      let opts = [''];
+      let quote = false;
+      for (let c of nullthrows(process.env.NODE_OPTIONS.match(/.|^$/g))) {
+        if (c === '"') {
+          quote = !quote;
+        } else if (!quote && c === ' ') {
+          opts.push('');
+        } else {
+          opts[opts.length - 1] += c.replace(/\\(.)/, '$1');
+        }
+      }
+
       for (let i = 0; i < opts.length; i++) {
         let opt = opts[i];
         if (opt === '-r' || opt === '--require') {
@@ -94,6 +115,7 @@ export default class Worker extends EventEmitter {
           forkModule,
           {
             shouldPatchConsole: !!this.options.shouldPatchConsole,
+            shouldTrace: !!this.options.shouldTrace,
           },
         ],
         retries: 0,
@@ -121,8 +143,9 @@ export default class Worker extends EventEmitter {
     this.emit('ready');
   }
 
-  sendSharedReference(ref: SharedReference, value: mixed) {
-    new Promise((resolve, reject) => {
+  sendSharedReference(ref: SharedReference, value: mixed): Promise<any> {
+    this.sentSharedReferences.add(ref);
+    return new Promise((resolve, reject) => {
       this.call({
         method: 'createSharedReference',
         args: [ref, value],
